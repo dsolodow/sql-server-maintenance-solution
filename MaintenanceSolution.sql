@@ -1,4 +1,4 @@
-﻿/*
+/*
 
 SQL Server Maintenance Solution - SQL Server 2005, SQL Server 2008, SQL Server 2008 R2, SQL Server 2012, SQL Server 2014, SQL Server 2016, and SQL Server 2017
 
@@ -5412,4 +5412,3 @@ BEGIN
 
 END
 GO
-
