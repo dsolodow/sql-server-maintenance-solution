@@ -40,7 +40,13 @@ BEGIN
   DECLARE @DatabaseMessage nvarchar(max)
   DECLARE @ErrorMessage nvarchar(max)
 
+  DECLARE @StartTime datetime
+  DECLARE @SchemaName nvarchar(max)
+  DECLARE @ObjectName nvarchar(max)
+  DECLARE @Parameters nvarchar(max)
+
   DECLARE @Version numeric(18,10)
+  DECLARE @HostPlatform nvarchar(max)
   DECLARE @AmazonRDS bit
 
   DECLARE @Cluster nvarchar(max)
@@ -148,13 +154,43 @@ BEGIN
 
   SET @Version = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - 1) + '.' + REPLACE(RIGHT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)), LEN(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)))),'.','') AS numeric(18,10))
 
+  IF @Version >= 14
+  BEGIN
+    SELECT @HostPlatform = host_platform
+    FROM sys.dm_os_host_info
+  END
+  ELSE
+  BEGIN
+    SET @HostPlatform = 'Windows'
+  END
+
   SET @AmazonRDS = CASE WHEN DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa' THEN 1 ELSE 0 END
 
   ----------------------------------------------------------------------------------------------------
   --// Log initial information                                                                    //--
   ----------------------------------------------------------------------------------------------------
 
-  SET @StartMessage = 'Date and time: ' + CONVERT(nvarchar,GETDATE(),120)
+  SET @StartTime = GETDATE()
+  SET @SchemaName = (SELECT schemas.name FROM sys.schemas schemas INNER JOIN sys.objects objects ON schemas.[schema_id] = objects.[schema_id] WHERE [object_id] = @@PROCID)
+  SET @ObjectName = OBJECT_NAME(@@PROCID)
+
+  SET @Parameters = '@Databases = ' + ISNULL('''' + REPLACE(@Databases,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @CheckCommands = ' + ISNULL('''' + REPLACE(@CheckCommands,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @PhysicalOnly = ' + ISNULL('''' + REPLACE(@PhysicalOnly,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @NoIndex = ' + ISNULL('''' + REPLACE(@NoIndex,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @ExtendedLogicalChecks = ' + ISNULL('''' + REPLACE(@ExtendedLogicalChecks,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @TabLock = ' + ISNULL('''' + REPLACE(@TabLock,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @FileGroups = ' + ISNULL('''' + REPLACE(@FileGroups,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Objects = ' + ISNULL('''' + REPLACE(@Objects,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @MaxDOP = ' + ISNULL(CAST(@MaxDOP AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @AvailabilityGroups = ' + ISNULL('''' + REPLACE(@AvailabilityGroups,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @AvailabilityGroupReplicas = ' + ISNULL('''' + REPLACE(@AvailabilityGroupReplicas,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Updateability = ' + ISNULL('''' + REPLACE(@Updateability,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @LockTimeout = ' + ISNULL(CAST(@LockTimeout AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
+
+  SET @StartMessage = 'Date and time: ' + CONVERT(nvarchar,@StartTime,120)
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
   SET @StartMessage = 'Server: ' + CAST(SERVERPROPERTY('ServerName') AS nvarchar(max))
@@ -166,24 +202,13 @@ BEGIN
   SET @StartMessage = 'Edition: ' + CAST(SERVERPROPERTY('Edition') AS nvarchar(max))
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
-  SET @StartMessage = 'Procedure: ' + QUOTENAME(DB_NAME(DB_ID())) + '.' + (SELECT QUOTENAME(schemas.name) FROM sys.schemas schemas INNER JOIN sys.objects objects ON schemas.[schema_id] = objects.[schema_id] WHERE [object_id] = @@PROCID) + '.' + QUOTENAME(OBJECT_NAME(@@PROCID))
+  SET @StartMessage = 'Platform: ' + @HostPlatform
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
-  SET @StartMessage = 'Parameters: @Databases = ' + ISNULL('''' + REPLACE(@Databases,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @CheckCommands = ' + ISNULL('''' + REPLACE(@CheckCommands,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @PhysicalOnly = ' + ISNULL('''' + REPLACE(@PhysicalOnly,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @NoIndex = ' + ISNULL('''' + REPLACE(@NoIndex,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @ExtendedLogicalChecks = ' + ISNULL('''' + REPLACE(@ExtendedLogicalChecks,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @TabLock = ' + ISNULL('''' + REPLACE(@TabLock,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @FileGroups = ' + ISNULL('''' + REPLACE(@FileGroups,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Objects = ' + ISNULL('''' + REPLACE(@Objects,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @MaxDOP = ' + ISNULL(CAST(@MaxDOP AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @AvailabilityGroups = ' + ISNULL('''' + REPLACE(@AvailabilityGroups,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @AvailabilityGroupReplicas = ' + ISNULL('''' + REPLACE(@AvailabilityGroupReplicas,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Updateability = ' + ISNULL('''' + REPLACE(@Updateability,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @LockTimeout = ' + ISNULL(CAST(@LockTimeout AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
+  SET @StartMessage = 'Procedure: ' + QUOTENAME(DB_NAME(DB_ID())) + '.' + QUOTENAME(@SchemaName) + '.' + QUOTENAME(@ObjectName)
+  RAISERROR(@StartMessage,10,1) WITH NOWAIT
+
+  SET @StartMessage = 'Parameters: ' + @Parameters
   SET @StartMessage = REPLACE(@StartMessage,'%','%%')
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
@@ -283,30 +308,32 @@ BEGIN
   FROM Databases4
   OPTION (MAXRECURSION 0)
 
-  IF @Version >= 11 AND SERVERPROPERTY('EngineEdition') <> 5
+  IF @Version >= 11
   BEGIN
-    INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, [Snapshot], Selected, Completed)
-    SELECT [name] AS DatabaseName,
-           CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
-           CASE WHEN name IN (SELECT availability_databases_cluster.database_name FROM sys.availability_databases_cluster availability_databases_cluster INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id) THEN 1 ELSE 0 END AS AvailabilityGroup,
-           CASE WHEN source_database_id IS NOT NULL THEN 1 ELSE 0 END AS [Snapshot],
-           0 AS Selected,
-           0 AS Completed
-    FROM sys.databases
-    ORDER BY [name] ASC
+    INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
+    SELECT name AS AvailabilityGroupName,
+            0 AS Selected
+    FROM sys.availability_groups
+
+    INSERT INTO @tmpDatabasesAvailabilityGroups (DatabaseName, AvailabilityGroupName)
+    SELECT availability_databases_cluster.database_name, availability_groups.name
+    FROM sys.availability_databases_cluster availability_databases_cluster
+    INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
   END
-  ELSE
-  BEGIN
-    INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, [Snapshot], Selected, Completed)
-    SELECT [name] AS DatabaseName,
-           CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
-           NULL AS AvailabilityGroup,
-           CASE WHEN source_database_id IS NOT NULL THEN 1 ELSE 0 END AS [Snapshot],
-           0 AS Selected,
-           0 AS Completed
-    FROM sys.databases
-    ORDER BY [name] ASC
-  END
+
+  INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, [Snapshot], Selected, Completed)
+  SELECT [name] AS DatabaseName,
+          CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
+          NULL AS AvailabilityGroup,
+          CASE WHEN source_database_id IS NOT NULL THEN 1 ELSE 0 END AS [Snapshot],
+          0 AS Selected,
+          0 AS Completed
+  FROM sys.databases
+  ORDER BY [name] ASC
+
+  UPDATE tmpDatabases
+  SET AvailabilityGroup = CASE WHEN EXISTS (SELECT * FROM @tmpDatabasesAvailabilityGroups WHERE DatabaseName = tmpDatabases.DatabaseName) THEN 1 ELSE 0 END
+  FROM @tmpDatabases tmpDatabases
 
   UPDATE tmpDatabases
   SET tmpDatabases.Selected = SelectedDatabases.Selected
@@ -386,11 +413,6 @@ BEGIN
     FROM AvailabilityGroups4
     OPTION (MAXRECURSION 0)
 
-    INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
-    SELECT name AS AvailabilityGroupName,
-           0 AS Selected
-    FROM sys.availability_groups
-
     UPDATE tmpAvailabilityGroups
     SET tmpAvailabilityGroups.Selected = SelectedAvailabilityGroups.Selected
     FROM @tmpAvailabilityGroups tmpAvailabilityGroups
@@ -404,11 +426,6 @@ BEGIN
     INNER JOIN @SelectedAvailabilityGroups SelectedAvailabilityGroups
     ON tmpAvailabilityGroups.AvailabilityGroupName LIKE REPLACE(SelectedAvailabilityGroups.AvailabilityGroupName,'_','[_]')
     WHERE SelectedAvailabilityGroups.Selected = 0
-
-    INSERT INTO @tmpDatabasesAvailabilityGroups (DatabaseName, AvailabilityGroupName)
-    SELECT availability_databases_cluster.database_name, availability_groups.name
-    FROM sys.availability_databases_cluster availability_databases_cluster
-    INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
 
     UPDATE tmpDatabases
     SET Selected = 1
@@ -614,7 +631,7 @@ BEGIN
     SET @Error = @@ERROR
   END
 
-  IF @MaxDOP < 0 OR @MaxDOP > 64 OR (@MaxDOP > 1 AND SERVERPROPERTY('EngineEdition') NOT IN (3,5)) OR (@MaxDOP IS NOT NULL AND @Version < 12.050000)
+  IF @MaxDOP < 0 OR @MaxDOP > 64 OR (@MaxDOP IS NOT NULL AND NOT (@Version >= 12.050000 OR SERVERPROPERTY('EngineEdition') IN (5, 8)))
   BEGIN
     SET @ErrorMessage = 'The value for the parameter @MaxDOP is not supported.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
@@ -756,7 +773,7 @@ BEGIN
   --// Execute commands                                                                           //--
   ----------------------------------------------------------------------------------------------------
 
-  WHILE EXISTS (SELECT * FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
+  WHILE (1 = 1)
   BEGIN
 
     SELECT TOP 1 @CurrentDBID = ID,
@@ -765,6 +782,11 @@ BEGIN
     WHERE Selected = 1
     AND Completed = 0
     ORDER BY ID ASC
+
+    IF @@ROWCOUNT = 0
+    BEGIN
+     BREAK
+    END
 
     SET @CurrentDatabaseID = DB_ID(@CurrentDatabaseName)
 
@@ -922,7 +944,7 @@ BEGIN
           SET @Error = @@ERROR
         END
 
-        WHILE EXISTS (SELECT * FROM @tmpFileGroups WHERE Selected = 1 AND Completed = 0)
+        WHILE (1 = 1)
         BEGIN
           SELECT TOP 1 @CurrentFGID = ID,
                        @CurrentFileGroupID = FileGroupID,
@@ -931,6 +953,11 @@ BEGIN
           WHERE Selected = 1
           AND Completed = 0
           ORDER BY ID ASC
+
+          IF @@ROWCOUNT = 0
+          BEGIN
+            BREAK
+          END
 
           -- Does the filegroup exist?
           SET @CurrentCommand03 = ''
@@ -1054,7 +1081,7 @@ BEGIN
           SET @Error = @@ERROR
         END
 
-        WHILE EXISTS (SELECT * FROM @tmpObjects WHERE Selected = 1 AND Completed = 0)
+        WHILE (1 = 1)
         BEGIN
           SELECT TOP 1 @CurrentOID = ID,
                        @CurrentSchemaID = SchemaID,
@@ -1066,6 +1093,11 @@ BEGIN
           WHERE Selected = 1
           AND Completed = 0
           ORDER BY ID ASC
+
+          IF @@ROWCOUNT = 0
+          BEGIN
+            BREAK
+          END
 
           -- Does the object exist?
           SET @CurrentCommand07 = ''

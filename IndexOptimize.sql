@@ -56,12 +56,16 @@ BEGIN
   DECLARE @DatabaseMessage nvarchar(max)
   DECLARE @ErrorMessage nvarchar(max)
 
+  DECLARE @StartTime datetime
+  DECLARE @SchemaName nvarchar(max)
+  DECLARE @ObjectName nvarchar(max)
+  DECLARE @Parameters nvarchar(max)
+
   DECLARE @Version numeric(18,10)
+  DECLARE @HostPlatform nvarchar(max)
   DECLARE @AmazonRDS bit
 
   DECLARE @Cluster nvarchar(max)
-
-  DECLARE @StartTime datetime
 
   DECLARE @CurrentDBID int
   DECLARE @CurrentDatabaseID int
@@ -190,6 +194,11 @@ BEGIN
 
   DECLARE @CurrentActionsAllowed TABLE ([Action] nvarchar(max))
 
+  DECLARE @CurrentUpdateStatisticsWithClauseArguments TABLE (ID int IDENTITY,
+                                                             Argument nvarchar(max))
+
+  DECLARE @CurrentUpdateStatisticsWithClause nvarchar(max)
+
   DECLARE @Error int
   DECLARE @ReturnCode int
 
@@ -198,13 +207,53 @@ BEGIN
 
   SET @Version = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - 1) + '.' + REPLACE(RIGHT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)), LEN(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)))),'.','') AS numeric(18,10))
 
+  IF @Version >= 14
+  BEGIN
+    SELECT @HostPlatform = host_platform
+    FROM sys.dm_os_host_info
+  END
+  ELSE
+  BEGIN
+    SET @HostPlatform = 'Windows'
+  END
+
   SET @AmazonRDS = CASE WHEN DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa' THEN 1 ELSE 0 END
 
   ----------------------------------------------------------------------------------------------------
   --// Log initial information                                                                    //--
   ----------------------------------------------------------------------------------------------------
 
-  SET @StartTime = CONVERT(datetime,CONVERT(nvarchar,GETDATE(),120),120)
+  SET @StartTime = GETDATE()
+  SET @SchemaName = (SELECT schemas.name FROM sys.schemas schemas INNER JOIN sys.objects objects ON schemas.[schema_id] = objects.[schema_id] WHERE [object_id] = @@PROCID)
+  SET @ObjectName = OBJECT_NAME(@@PROCID)
+
+  SET @Parameters = '@Databases = ' + ISNULL('''' + REPLACE(@Databases,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @FragmentationLow = ' + ISNULL('''' + REPLACE(@FragmentationLow,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @FragmentationMedium = ' + ISNULL('''' + REPLACE(@FragmentationMedium,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @FragmentationHigh = ' + ISNULL('''' + REPLACE(@FragmentationHigh,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @FragmentationLevel1 = ' + ISNULL(CAST(@FragmentationLevel1 AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @FragmentationLevel2 = ' + ISNULL(CAST(@FragmentationLevel2 AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @PageCountLevel = ' + ISNULL(CAST(@PageCountLevel AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @SortInTempdb = ' + ISNULL('''' + REPLACE(@SortInTempdb,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @MaxDOP = ' + ISNULL(CAST(@MaxDOP AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @FillFactor = ' + ISNULL(CAST(@FillFactor AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @PadIndex = ' + ISNULL('''' + REPLACE(@PadIndex,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @LOBCompaction = ' + ISNULL('''' + REPLACE(@LOBCompaction,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @UpdateStatistics = ' + ISNULL('''' + REPLACE(@UpdateStatistics,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @OnlyModifiedStatistics = ' + ISNULL('''' + REPLACE(@OnlyModifiedStatistics,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @StatisticsSample = ' + ISNULL(CAST(@StatisticsSample AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @StatisticsResample = ' + ISNULL('''' + REPLACE(@StatisticsResample,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @PartitionLevel = ' + ISNULL('''' + REPLACE(@PartitionLevel,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @MSShippedObjects = ' + ISNULL('''' + REPLACE(@MSShippedObjects,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Indexes = ' + ISNULL('''' + REPLACE(@Indexes,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @TimeLimit = ' + ISNULL(CAST(@TimeLimit AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @Delay = ' + ISNULL(CAST(@Delay AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @WaitAtLowPriorityMaxDuration = ' + ISNULL(CAST(@WaitAtLowPriorityMaxDuration AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @WaitAtLowPriorityAbortAfterWait = ' + ISNULL('''' + REPLACE(@WaitAtLowPriorityAbortAfterWait,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @AvailabilityGroups = ' + ISNULL('''' + REPLACE(@AvailabilityGroups,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @LockTimeout = ' + ISNULL(CAST(@LockTimeout AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
 
   SET @StartMessage = 'Date and time: ' + CONVERT(nvarchar,@StartTime,120)
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
@@ -218,36 +267,13 @@ BEGIN
   SET @StartMessage = 'Edition: ' + CAST(SERVERPROPERTY('Edition') AS nvarchar(max))
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
-  SET @StartMessage = 'Procedure: ' + QUOTENAME(DB_NAME(DB_ID())) + '.' + (SELECT QUOTENAME(schemas.name) FROM sys.schemas schemas INNER JOIN sys.objects objects ON schemas.[schema_id] = objects.[schema_id] WHERE [object_id] = @@PROCID) + '.' + QUOTENAME(OBJECT_NAME(@@PROCID))
+  SET @StartMessage = 'Platform: ' + @HostPlatform
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
-  SET @StartMessage = 'Parameters: @Databases = ' + ISNULL('''' + REPLACE(@Databases,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @FragmentationLow = ' + ISNULL('''' + REPLACE(@FragmentationLow,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @FragmentationMedium = ' + ISNULL('''' + REPLACE(@FragmentationMedium,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @FragmentationHigh = ' + ISNULL('''' + REPLACE(@FragmentationHigh,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @FragmentationLevel1 = ' + ISNULL(CAST(@FragmentationLevel1 AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @FragmentationLevel2 = ' + ISNULL(CAST(@FragmentationLevel2 AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @PageCountLevel = ' + ISNULL(CAST(@PageCountLevel AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @SortInTempdb = ' + ISNULL('''' + REPLACE(@SortInTempdb,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @MaxDOP = ' + ISNULL(CAST(@MaxDOP AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @FillFactor = ' + ISNULL(CAST(@FillFactor AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @PadIndex = ' + ISNULL('''' + REPLACE(@PadIndex,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @LOBCompaction = ' + ISNULL('''' + REPLACE(@LOBCompaction,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @UpdateStatistics = ' + ISNULL('''' + REPLACE(@UpdateStatistics,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @OnlyModifiedStatistics = ' + ISNULL('''' + REPLACE(@OnlyModifiedStatistics,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @StatisticsSample = ' + ISNULL(CAST(@StatisticsSample AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @StatisticsResample = ' + ISNULL('''' + REPLACE(@StatisticsResample,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @PartitionLevel = ' + ISNULL('''' + REPLACE(@PartitionLevel,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @MSShippedObjects = ' + ISNULL('''' + REPLACE(@MSShippedObjects,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Indexes = ' + ISNULL('''' + REPLACE(@Indexes,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @TimeLimit = ' + ISNULL(CAST(@TimeLimit AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @Delay = ' + ISNULL(CAST(@Delay AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @WaitAtLowPriorityMaxDuration = ' + ISNULL(CAST(@WaitAtLowPriorityMaxDuration AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @WaitAtLowPriorityAbortAfterWait = ' + ISNULL('''' + REPLACE(@WaitAtLowPriorityAbortAfterWait,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @AvailabilityGroups = ' + ISNULL('''' + REPLACE(@AvailabilityGroups,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @LockTimeout = ' + ISNULL(CAST(@LockTimeout AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
+  SET @StartMessage = 'Procedure: ' + QUOTENAME(DB_NAME(DB_ID())) + '.' + QUOTENAME(@SchemaName) + '.' + QUOTENAME(@ObjectName)
+  RAISERROR(@StartMessage,10,1) WITH NOWAIT
+
+  SET @StartMessage = 'Parameters: ' + @Parameters
   SET @StartMessage = REPLACE(@StartMessage,'%','%%')
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
@@ -340,32 +366,33 @@ BEGIN
   FROM Databases4
   OPTION (MAXRECURSION 0)
 
-  IF @Version >= 11 AND SERVERPROPERTY('EngineEdition') <> 5
+  IF @Version >= 11
   BEGIN
-    INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, Selected, Completed)
-    SELECT [name] AS DatabaseName,
-           CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
-           CASE WHEN name IN (SELECT availability_databases_cluster.database_name FROM sys.availability_databases_cluster availability_databases_cluster INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id) THEN 1 ELSE 0 END AS AvailabilityGroup,
-           0 AS Selected,
-           0 AS Completed
-    FROM sys.databases
-    WHERE [name] <> 'tempdb'
-    AND source_database_id IS NULL
-    ORDER BY [name] ASC
+    INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
+    SELECT name AS AvailabilityGroupName,
+            0 AS Selected
+    FROM sys.availability_groups
+
+    INSERT INTO @tmpDatabasesAvailabilityGroups (DatabaseName, AvailabilityGroupName)
+    SELECT availability_databases_cluster.database_name, availability_groups.name
+    FROM sys.availability_databases_cluster availability_databases_cluster
+    INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
   END
-  ELSE
-  BEGIN
-    INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, Selected, Completed)
-    SELECT [name] AS DatabaseName,
-           CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
-           NULL AS AvailabilityGroup,
-           0 AS Selected,
-           0 AS Completed
-    FROM sys.databases
-    WHERE [name] <> 'tempdb'
-    AND source_database_id IS NULL
-    ORDER BY [name] ASC
-  END
+
+  INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, Selected, Completed)
+  SELECT [name] AS DatabaseName,
+          CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
+          NULL AS AvailabilityGroup,
+          0 AS Selected,
+          0 AS Completed
+  FROM sys.databases
+  WHERE [name] <> 'tempdb'
+  AND source_database_id IS NULL
+  ORDER BY [name] ASC
+
+  UPDATE tmpDatabases
+  SET AvailabilityGroup = CASE WHEN EXISTS (SELECT * FROM @tmpDatabasesAvailabilityGroups WHERE DatabaseName = tmpDatabases.DatabaseName) THEN 1 ELSE 0 END
+  FROM @tmpDatabases tmpDatabases
 
   UPDATE tmpDatabases
   SET tmpDatabases.Selected = SelectedDatabases.Selected
@@ -443,11 +470,6 @@ BEGIN
     FROM AvailabilityGroups4
     OPTION (MAXRECURSION 0)
 
-    INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
-    SELECT name AS AvailabilityGroupName,
-           0 AS Selected
-    FROM sys.availability_groups
-
     UPDATE tmpAvailabilityGroups
     SET tmpAvailabilityGroups.Selected = SelectedAvailabilityGroups.Selected
     FROM @tmpAvailabilityGroups tmpAvailabilityGroups
@@ -461,11 +483,6 @@ BEGIN
     INNER JOIN @SelectedAvailabilityGroups SelectedAvailabilityGroups
     ON tmpAvailabilityGroups.AvailabilityGroupName LIKE REPLACE(SelectedAvailabilityGroups.AvailabilityGroupName,'_','[_]')
     WHERE SelectedAvailabilityGroups.Selected = 0
-
-    INSERT INTO @tmpDatabasesAvailabilityGroups (DatabaseName, AvailabilityGroupName)
-    SELECT availability_databases_cluster.database_name, availability_groups.name
-    FROM sys.availability_databases_cluster availability_databases_cluster
-    INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
 
     UPDATE tmpDatabases
     SET Selected = 1
@@ -668,7 +685,7 @@ BEGIN
     SET @Error = @@ERROR
   END
 
-  IF @MaxDOP < 0 OR @MaxDOP > 64 OR (@MaxDOP > 1 AND SERVERPROPERTY('EngineEdition') NOT IN (3,5))
+  IF @MaxDOP < 0 OR @MaxDOP > 64
   BEGIN
     SET @ErrorMessage = 'The value for the parameter @MaxDOP is not supported.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
@@ -869,7 +886,7 @@ BEGIN
   --// Execute commands                                                                           //--
   ----------------------------------------------------------------------------------------------------
 
-  WHILE EXISTS (SELECT * FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
+  WHILE (1 = 1)
   BEGIN
 
     SELECT TOP 1 @CurrentDBID = ID,
@@ -878,6 +895,11 @@ BEGIN
     WHERE Selected = 1
     AND Completed = 0
     ORDER BY ID ASC
+
+    IF @@ROWCOUNT = 0
+    BEGIN
+      BREAK
+    END
 
     SET @CurrentDatabaseID = DB_ID(@CurrentDatabaseName)
 
@@ -1054,7 +1076,7 @@ BEGIN
         SET @Error = @@ERROR
       END
 
-      WHILE EXISTS (SELECT * FROM @tmpIndexesStatistics WHERE Selected = 1 AND Completed = 0 AND (GETDATE() < DATEADD(ss,@TimeLimit,@StartTime) OR @TimeLimit IS NULL))
+      WHILE (GETDATE() < DATEADD(ss,@TimeLimit,@StartTime) OR @TimeLimit IS NULL)
       BEGIN
 
         SELECT TOP 1 @CurrentIxID = ID,
@@ -1076,6 +1098,11 @@ BEGIN
         WHERE Selected = 1
         AND Completed = 0
         ORDER BY ID ASC
+
+        IF @@ROWCOUNT = 0
+        BEGIN
+          BREAK
+        END
 
         -- Is the index a partition?
         IF @CurrentPartitionNumber IS NULL OR @CurrentPartitionCount = 1 BEGIN SET @CurrentIsPartition = 0 END ELSE BEGIN SET @CurrentIsPartition = 1 END
@@ -1381,7 +1408,7 @@ BEGIN
           OR (@CurrentIndexType = 1 AND @CurrentIsImageText = 0 AND @CurrentIsFileStream = 0 AND @Version >= 11)
           OR (@CurrentIndexType = 2 AND @Version >= 11))
           AND (@CurrentIsColumnStore = 0 OR @Version < 11)
-          AND SERVERPROPERTY('EngineEdition') IN (3,5)
+          AND SERVERPROPERTY('EngineEdition') IN (3,5,8)
           BEGIN
             INSERT INTO @CurrentActionsAllowed ([Action])
             VALUES ('INDEX_REBUILD_ONLINE')
@@ -1516,6 +1543,8 @@ BEGIN
           END
         END
 
+        SET @CurrentMaxDOP = @MaxDOP
+
         IF @CurrentStatisticsID IS NOT NULL AND @CurrentUpdateStatistics = 'Y' AND (GETDATE() < DATEADD(ss,@TimeLimit,@StartTime) OR @TimeLimit IS NULL)
         BEGIN
           SET @CurrentCommandType14 = 'UPDATE_STATISTICS'
@@ -1523,12 +1552,49 @@ BEGIN
           SET @CurrentCommand14 = ''
           IF @LockTimeout IS NOT NULL SET @CurrentCommand14 = 'SET LOCK_TIMEOUT ' + CAST(@LockTimeout * 1000 AS nvarchar) + '; '
           SET @CurrentCommand14 = @CurrentCommand14 + 'UPDATE STATISTICS ' + QUOTENAME(@CurrentDatabaseName) + '.' + QUOTENAME(@CurrentSchemaName) + '.' + QUOTENAME(@CurrentObjectName) + ' ' + QUOTENAME(@CurrentStatisticsName)
-          IF @CurrentStatisticsSample IS NOT NULL OR @CurrentStatisticsResample = 'Y' OR @CurrentNoRecompute = 1 SET @CurrentCommand14 = @CurrentCommand14 + ' WITH'
-          IF @CurrentStatisticsSample = 100 SET @CurrentCommand14 = @CurrentCommand14 + ' FULLSCAN'
-          IF @CurrentStatisticsSample IS NOT NULL AND @CurrentStatisticsSample <> 100 SET @CurrentCommand14 = @CurrentCommand14 + ' SAMPLE ' + CAST(@CurrentStatisticsSample AS nvarchar) + ' PERCENT'
-          IF @CurrentStatisticsResample = 'Y' SET @CurrentCommand14 = @CurrentCommand14 + ' RESAMPLE'
-          IF (@CurrentStatisticsSample IS NOT NULL OR @CurrentStatisticsResample = 'Y') AND @CurrentNoRecompute = 1 SET @CurrentCommand14 = @CurrentCommand14 + ','
-          IF @CurrentNoRecompute = 1 SET @CurrentCommand14 = @CurrentCommand14 + ' NORECOMPUTE'
+
+          IF @CurrentStatisticsSample = 100
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'FULLSCAN'
+          END
+
+          IF @CurrentStatisticsSample IS NOT NULL AND @CurrentStatisticsSample <> 100
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'SAMPLE ' + CAST(@CurrentStatisticsSample AS nvarchar) + ' PERCENT'
+          END
+
+          IF @CurrentStatisticsResample = 'Y'
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'RESAMPLE'
+          END
+
+          IF @CurrentNoRecompute = 1
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'NORECOMPUTE'
+          END
+
+          IF @CurrentMaxDOP IS NOT NULL AND ((@Version >= 13.05026 AND @Version < 14) OR @Version >= 14.030154)
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'MAXDOP = ' + CAST(@CurrentMaxDOP AS nvarchar)
+          END
+
+          IF EXISTS (SELECT * FROM @CurrentUpdateStatisticsWithClauseArguments)
+          BEGIN
+            SET @CurrentUpdateStatisticsWithClause = ' WITH'
+
+            SELECT @CurrentUpdateStatisticsWithClause = @CurrentUpdateStatisticsWithClause + ' ' + Argument + ','
+            FROM @CurrentUpdateStatisticsWithClauseArguments
+            ORDER BY ID ASC
+
+            SET @CurrentUpdateStatisticsWithClause = LEFT(@CurrentUpdateStatisticsWithClause,LEN(@CurrentUpdateStatisticsWithClause) - 1)
+          END
+
+          IF @CurrentUpdateStatisticsWithClause IS NOT NULL SET @CurrentCommand14 = @CurrentCommand14 + @CurrentUpdateStatisticsWithClause
 
           EXECUTE @CurrentCommandOutput14 = [dbo].[CommandExecute] @Command = @CurrentCommand14, @CommandType = @CurrentCommandType14, @Mode = 2, @DatabaseName = @CurrentDatabaseName, @SchemaName = @CurrentSchemaName, @ObjectName = @CurrentObjectName, @ObjectType = @CurrentObjectType, @IndexName = @CurrentIndexName, @IndexType = @CurrentIndexType, @StatisticsName = @CurrentStatisticsName, @LogToTable = @LogToTable, @Execute = @Execute
           SET @Error = @@ERROR
@@ -1602,8 +1668,10 @@ BEGIN
         SET @CurrentStatisticsResample = NULL
         SET @CurrentComment = NULL
         SET @CurrentExtendedInfo = NULL
+        SET @CurrentUpdateStatisticsWithClause = NULL
 
         DELETE FROM @CurrentActionsAllowed
+        DELETE FROM @CurrentUpdateStatisticsWithClauseArguments
 
       END
 

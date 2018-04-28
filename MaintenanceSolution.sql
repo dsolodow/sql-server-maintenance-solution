@@ -10,7 +10,7 @@ The solution is free: https://ola.hallengren.com/license.html
 
 You can contact me by e-mail at ola@hallengren.com.
 
-Last updated 2 April, 2018.
+Last updated 27 April, 2018.
 
 Ola Hallengren
 https://ola.hallengren.com
@@ -26,8 +26,6 @@ DECLARE @BackupDirectory nvarchar(max)
 DECLARE @CleanupTime int
 DECLARE @OutputFileDirectory nvarchar(max)
 DECLARE @LogToTable nvarchar(max)
-DECLARE @Version numeric(18,10)
-DECLARE @Error int
 
 SET @CreateJobs          = 'Y'          -- Specify whether jobs should be created.
 SET @BackupDirectory     = N'C:\Backup' -- Specify the backup root directory.
@@ -35,14 +33,9 @@ SET @CleanupTime         = NULL         -- Time in hours, after which backup fil
 SET @OutputFileDirectory = NULL         -- Specify the output file directory. If no directory is specified, then the SQL Server error log directory is used.
 SET @LogToTable          = 'Y'          -- Log commands to a table.
 
-SET @Error = 0
-
-SET @Version = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - 1) + '.' + REPLACE(RIGHT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)), LEN(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)))),'.','') AS numeric(18,10))
-
-IF IS_SRVROLEMEMBER('sysadmin') = 0
+IF IS_SRVROLEMEMBER('sysadmin') = 0 AND NOT (DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa')
 BEGIN
-  RAISERROR('You need to be a member of the SysAdmin server role to install the solution.',16,1)
-  SET @Error = @@ERROR
+  RAISERROR('You need to be a member of the SysAdmin server role to install the SQL Server Maintenance Solution.',16,1)
 END
 
 IF OBJECT_ID('tempdb..#Config') IS NOT NULL DROP TABLE #Config
@@ -50,44 +43,12 @@ IF OBJECT_ID('tempdb..#Config') IS NOT NULL DROP TABLE #Config
 CREATE TABLE #Config ([Name] nvarchar(max),
                       [Value] nvarchar(max))
 
-IF @CreateJobs = 'Y' AND @OutputFileDirectory IS NULL AND SERVERPROPERTY('EngineEdition') <> 4 AND @Version < 12
-BEGIN
-  IF @Version >= 11
-  BEGIN
-    SELECT @OutputFileDirectory = [path]
-    FROM sys.dm_os_server_diagnostics_log_configurations
-  END
-  ELSE
-  BEGIN
-    SELECT @OutputFileDirectory = LEFT(CAST(SERVERPROPERTY('ErrorLogFileName') AS nvarchar(max)),LEN(CAST(SERVERPROPERTY('ErrorLogFileName') AS nvarchar(max))) - CHARINDEX('\',REVERSE(CAST(SERVERPROPERTY('ErrorLogFileName') AS nvarchar(max)))))
-  END
-END
-
-IF @CreateJobs = 'Y' AND RIGHT(@OutputFileDirectory,1) = '\' AND SERVERPROPERTY('EngineEdition') <> 4
-BEGIN
-  SET @OutputFileDirectory = LEFT(@OutputFileDirectory, LEN(@OutputFileDirectory) - 1)
-END
-
-INSERT INTO #Config ([Name], [Value])
-VALUES('CreateJobs', @CreateJobs)
-
-INSERT INTO #Config ([Name], [Value])
-VALUES('BackupDirectory', @BackupDirectory)
-
-INSERT INTO #Config ([Name], [Value])
-VALUES('CleanupTime', @CleanupTime)
-
-INSERT INTO #Config ([Name], [Value])
-VALUES('OutputFileDirectory', @OutputFileDirectory)
-
-INSERT INTO #Config ([Name], [Value])
-VALUES('LogToTable', @LogToTable)
-
-INSERT INTO #Config ([Name], [Value])
-VALUES('DatabaseName', DB_NAME(DB_ID()))
-
-INSERT INTO #Config ([Name], [Value])
-VALUES('Error', CAST(@Error AS nvarchar))
+INSERT INTO #Config ([Name], [Value]) VALUES('CreateJobs', @CreateJobs)
+INSERT INTO #Config ([Name], [Value]) VALUES('BackupDirectory', @BackupDirectory)
+INSERT INTO #Config ([Name], [Value]) VALUES('CleanupTime', @CleanupTime)
+INSERT INTO #Config ([Name], [Value]) VALUES('OutputFileDirectory', @OutputFileDirectory)
+INSERT INTO #Config ([Name], [Value]) VALUES('LogToTable', @LogToTable)
+INSERT INTO #Config ([Name], [Value]) VALUES('DatabaseName', DB_NAME(DB_ID()))
 GO
 SET ANSI_NULLS ON
 GO
@@ -371,6 +332,10 @@ ALTER PROCEDURE [dbo].[DatabaseBackup]
 @MirrorCleanupMode nvarchar(max) = 'AFTER_BACKUP',
 @AvailabilityGroups nvarchar(max) = NULL,
 @Updateability nvarchar(max) = 'ALL',
+@AdaptiveCompression nvarchar(max) = NULL,
+@ModificationLevel int = NULL,
+@LogSizeSinceLastLogBackup int = NULL,
+@TimeSinceLastLogBackup int = NULL,
 @LogToTable nvarchar(max) = 'N',
 @Execute nvarchar(max) = 'Y'
 
@@ -388,6 +353,11 @@ BEGIN
   DECLARE @EndMessage nvarchar(max)
   DECLARE @DatabaseMessage nvarchar(max)
   DECLARE @ErrorMessage nvarchar(max)
+
+  DECLARE @StartTime datetime
+  DECLARE @SchemaName nvarchar(max)
+  DECLARE @ObjectName nvarchar(max)
+  DECLARE @Parameters nvarchar(max)
 
   DECLARE @Version numeric(18,10)
   DECLARE @HostPlatform nvarchar(max)
@@ -428,6 +398,10 @@ BEGIN
   DECLARE @CurrentIsReadOnly bit
   DECLARE @CurrentBackupSetID int
   DECLARE @CurrentIsMirror bit
+  DECLARE @CurrentLastLogBackup datetime
+  DECLARE @CurrentLogSizeSinceLastLogBackup float
+  DECLARE @CurrentAllocatedExtentPageCount bigint
+  DECLARE @CurrentModifiedExtentPageCount bigint
 
   DECLARE @CurrentCommand01 nvarchar(max)
   DECLARE @CurrentCommand02 nvarchar(max)
@@ -435,6 +409,7 @@ BEGIN
   DECLARE @CurrentCommand04 nvarchar(max)
   DECLARE @CurrentCommand05 nvarchar(max)
   DECLARE @CurrentCommand06 nvarchar(max)
+  DECLARE @CurrentCommand07 nvarchar(max)
 
   DECLARE @CurrentCommandOutput01 int
   DECLARE @CurrentCommandOutput02 int
@@ -528,7 +503,52 @@ BEGIN
   --// Log initial information                                                                    //--
   ----------------------------------------------------------------------------------------------------
 
-  SET @StartMessage = 'Date and time: ' + CONVERT(nvarchar,GETDATE(),120)
+  SET @StartTime = GETDATE()
+  SET @SchemaName = (SELECT schemas.name FROM sys.schemas schemas INNER JOIN sys.objects objects ON schemas.[schema_id] = objects.[schema_id] WHERE [object_id] = @@PROCID)
+  SET @ObjectName = OBJECT_NAME(@@PROCID)
+
+  SET @Parameters = '@Databases = ' + ISNULL('''' + REPLACE(@Databases,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Directory = ' + ISNULL('''' + REPLACE(@Directory,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @BackupType = ' + ISNULL('''' + REPLACE(@BackupType,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Verify = ' + ISNULL('''' + REPLACE(@Verify,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @CleanupMode = ' + ISNULL('''' + REPLACE(@CleanupMode,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Compress = ' + ISNULL('''' + REPLACE(@Compress,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @CopyOnly = ' + ISNULL('''' + REPLACE(@CopyOnly,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @ChangeBackupType = ' + ISNULL('''' + REPLACE(@ChangeBackupType,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @BackupSoftware = ' + ISNULL('''' + REPLACE(@BackupSoftware,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @CheckSum = ' + ISNULL('''' + REPLACE(@CheckSum,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @BlockSize = ' + ISNULL(CAST(@BlockSize AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @BufferCount = ' + ISNULL(CAST(@BufferCount AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @MaxTransferSize = ' + ISNULL(CAST(@MaxTransferSize AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @NumberOfFiles = ' + ISNULL(CAST(@NumberOfFiles AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @CompressionLevel = ' + ISNULL(CAST(@CompressionLevel AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @Description = ' + ISNULL('''' + REPLACE(@Description,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Threads = ' + ISNULL(CAST(@Threads AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @Throttle = ' + ISNULL(CAST(@Throttle AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @Encrypt = ' + ISNULL('''' + REPLACE(@Encrypt,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @EncryptionAlgorithm = ' + ISNULL('''' + REPLACE(@EncryptionAlgorithm,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @ServerCertificate = ' + ISNULL('''' + REPLACE(@ServerCertificate,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @ServerAsymmetricKey = ' + ISNULL('''' + REPLACE(@ServerAsymmetricKey,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @EncryptionKey = ' + ISNULL('''' + REPLACE(@EncryptionKey,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @ReadWriteFileGroups = ' + ISNULL('''' + REPLACE(@ReadWriteFileGroups,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @OverrideBackupPreference = ' + ISNULL('''' + REPLACE(@OverrideBackupPreference,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @NoRecovery = ' + ISNULL('''' + REPLACE(@NoRecovery,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @URL = ' + ISNULL('''' + REPLACE(@URL,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Credential = ' + ISNULL('''' + REPLACE(@Credential,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @MirrorDirectory = ' + ISNULL('''' + REPLACE(@MirrorDirectory,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @MirrorCleanupTime = ' + ISNULL(CAST(@MirrorCleanupTime AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @MirrorCleanupMode = ' + ISNULL('''' + REPLACE(@MirrorCleanupMode,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @AvailabilityGroups = ' + ISNULL('''' + REPLACE(@AvailabilityGroups,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Updateability = ' + ISNULL('''' + REPLACE(@Updateability,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @AdaptiveCompression = ' + ISNULL('''' + REPLACE(@AdaptiveCompression,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @ModificationLevel = ' + ISNULL(CAST(@ModificationLevel AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @LogSizeSinceLastLogBackup = ' + ISNULL(CAST(@LogSizeSinceLastLogBackup AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @TimeSinceLastLogBackup = ' + ISNULL(CAST(@TimeSinceLastLogBackup AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
+
+  SET @StartMessage = 'Date and time: ' + CONVERT(nvarchar,@StartTime,120)
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
   SET @StartMessage = 'Server: ' + CAST(SERVERPROPERTY('ServerName') AS nvarchar(max))
@@ -543,45 +563,10 @@ BEGIN
   SET @StartMessage = 'Platform: ' + @HostPlatform
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
-  SET @StartMessage = 'Procedure: ' + QUOTENAME(DB_NAME(DB_ID())) + '.' + (SELECT QUOTENAME(schemas.name) FROM sys.schemas schemas INNER JOIN sys.objects objects ON schemas.[schema_id] = objects.[schema_id] WHERE [object_id] = @@PROCID) + '.' + QUOTENAME(OBJECT_NAME(@@PROCID))
+  SET @StartMessage = 'Procedure: ' + QUOTENAME(DB_NAME(DB_ID())) + '.' + QUOTENAME(@SchemaName) + '.' + QUOTENAME(@ObjectName)
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
-  SET @StartMessage = 'Parameters: @Databases = ' + ISNULL('''' + REPLACE(@Databases,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Directory = ' + ISNULL('''' + REPLACE(@Directory,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @BackupType = ' + ISNULL('''' + REPLACE(@BackupType,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Verify = ' + ISNULL('''' + REPLACE(@Verify,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @CleanupMode = ' + ISNULL('''' + REPLACE(@CleanupMode,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Compress = ' + ISNULL('''' + REPLACE(@Compress,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @CopyOnly = ' + ISNULL('''' + REPLACE(@CopyOnly,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @ChangeBackupType = ' + ISNULL('''' + REPLACE(@ChangeBackupType,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @BackupSoftware = ' + ISNULL('''' + REPLACE(@BackupSoftware,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @CheckSum = ' + ISNULL('''' + REPLACE(@CheckSum,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @BlockSize = ' + ISNULL(CAST(@BlockSize AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @BufferCount = ' + ISNULL(CAST(@BufferCount AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @MaxTransferSize = ' + ISNULL(CAST(@MaxTransferSize AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @NumberOfFiles = ' + ISNULL(CAST(@NumberOfFiles AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @CompressionLevel = ' + ISNULL(CAST(@CompressionLevel AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @Description = ' + ISNULL('''' + REPLACE(@Description,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Threads = ' + ISNULL(CAST(@Threads AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @Throttle = ' + ISNULL(CAST(@Throttle AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @Encrypt = ' + ISNULL('''' + REPLACE(@Encrypt,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @EncryptionAlgorithm = ' + ISNULL('''' + REPLACE(@EncryptionAlgorithm,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @ServerCertificate = ' + ISNULL('''' + REPLACE(@ServerCertificate,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @ServerAsymmetricKey = ' + ISNULL('''' + REPLACE(@ServerAsymmetricKey,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @EncryptionKey = ' + ISNULL('''' + REPLACE(@EncryptionKey,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @ReadWriteFileGroups = ' + ISNULL('''' + REPLACE(@ReadWriteFileGroups,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @OverrideBackupPreference = ' + ISNULL('''' + REPLACE(@OverrideBackupPreference,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @NoRecovery = ' + ISNULL('''' + REPLACE(@NoRecovery,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @URL = ' + ISNULL('''' + REPLACE(@URL,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Credential = ' + ISNULL('''' + REPLACE(@Credential,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @MirrorDirectory = ' + ISNULL('''' + REPLACE(@MirrorDirectory,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @MirrorCleanupTime = ' + ISNULL(CAST(@MirrorCleanupTime AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @MirrorCleanupMode = ' + ISNULL('''' + REPLACE(@MirrorCleanupMode,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @AvailabilityGroups = ' + ISNULL('''' + REPLACE(@AvailabilityGroups,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Updateability = ' + ISNULL('''' + REPLACE(@Updateability,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
+  SET @StartMessage = 'Parameters: ' + @Parameters
   SET @StartMessage = REPLACE(@StartMessage,'%','%%')
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
@@ -681,34 +666,34 @@ BEGIN
   FROM Databases4
   OPTION (MAXRECURSION 0)
 
-  IF @Version >= 11 AND SERVERPROPERTY('EngineEdition') <> 5
+  IF @Version >= 11
   BEGIN
-    INSERT INTO @tmpDatabases (DatabaseName, DatabaseNameFS, DatabaseType, AvailabilityGroup, Selected, Completed)
-    SELECT [name] AS DatabaseName,
-           LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE([name],'\',''),'/',''),':',''),'*',''),'?',''),'"',''),'<',''),'>',''),'|',''))) AS DatabaseNameFS,
-           CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
-           CASE WHEN name IN (SELECT availability_databases_cluster.database_name FROM sys.availability_databases_cluster availability_databases_cluster INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id) THEN 1 ELSE 0 END AS AvailabilityGroup,
-           0 AS Selected,
-           0 AS Completed
-    FROM sys.databases
-    WHERE [name] <> 'tempdb'
-    AND source_database_id IS NULL
-    ORDER BY [name] ASC
+    INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
+    SELECT name AS AvailabilityGroupName,
+            0 AS Selected
+    FROM sys.availability_groups
+
+    INSERT INTO @tmpDatabasesAvailabilityGroups (DatabaseName, AvailabilityGroupName)
+    SELECT availability_databases_cluster.database_name, availability_groups.name
+    FROM sys.availability_databases_cluster availability_databases_cluster
+    INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
   END
-  ELSE
-  BEGIN
-    INSERT INTO @tmpDatabases (DatabaseName, DatabaseNameFS, DatabaseType, AvailabilityGroup, Selected, Completed)
-    SELECT [name] AS DatabaseName,
-           LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE([name],'\',''),'/',''),':',''),'*',''),'?',''),'"',''),'<',''),'>',''),'|',''))) AS DatabaseNameFS,
-           CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
-           NULL AS AvailabilityGroup,
-           0 AS Selected,
-           0 AS Completed
-    FROM sys.databases
-    WHERE [name] <> 'tempdb'
-    AND source_database_id IS NULL
-    ORDER BY [name] ASC
-  END
+
+  INSERT INTO @tmpDatabases (DatabaseName, DatabaseNameFS, DatabaseType, AvailabilityGroup, Selected, Completed)
+  SELECT [name] AS DatabaseName,
+          LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE([name],'\',''),'/',''),':',''),'*',''),'?',''),'"',''),'<',''),'>',''),'|',''))) AS DatabaseNameFS,
+          CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
+          NULL AS AvailabilityGroup,
+          0 AS Selected,
+          0 AS Completed
+  FROM sys.databases
+  WHERE [name] <> 'tempdb'
+  AND source_database_id IS NULL
+  ORDER BY [name] ASC
+
+  UPDATE tmpDatabases
+  SET AvailabilityGroup = CASE WHEN EXISTS (SELECT * FROM @tmpDatabasesAvailabilityGroups WHERE DatabaseName = tmpDatabases.DatabaseName) THEN 1 ELSE 0 END
+  FROM @tmpDatabases tmpDatabases
 
   UPDATE tmpDatabases
   SET tmpDatabases.Selected = SelectedDatabases.Selected
@@ -786,11 +771,6 @@ BEGIN
     FROM AvailabilityGroups4
     OPTION (MAXRECURSION 0)
 
-    INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
-    SELECT name AS AvailabilityGroupName,
-           0 AS Selected
-    FROM sys.availability_groups
-
     UPDATE tmpAvailabilityGroups
     SET tmpAvailabilityGroups.Selected = SelectedAvailabilityGroups.Selected
     FROM @tmpAvailabilityGroups tmpAvailabilityGroups
@@ -804,11 +784,6 @@ BEGIN
     INNER JOIN @SelectedAvailabilityGroups SelectedAvailabilityGroups
     ON tmpAvailabilityGroups.AvailabilityGroupName LIKE REPLACE(SelectedAvailabilityGroups.AvailabilityGroupName,'_','[_]')
     WHERE SelectedAvailabilityGroups.Selected = 0
-
-    INSERT INTO @tmpDatabasesAvailabilityGroups (DatabaseName, AvailabilityGroupName)
-    SELECT availability_databases_cluster.database_name, availability_groups.name
-    FROM sys.availability_databases_cluster availability_databases_cluster
-    INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
 
     UPDATE tmpDatabases
     SET Selected = 1
@@ -880,8 +855,15 @@ BEGIN
   BEGIN
     EXECUTE [master].dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\Microsoft\MSSQLServer\MSSQLServer', N'BackupDirectory', @DefaultDirectory OUTPUT
 
-    INSERT INTO @Directories (ID, DirectoryPath, Mirror, Completed)
-    SELECT 1, @DefaultDirectory, 0, 0
+    IF @DefaultDirectory LIKE 'http://%' OR @DefaultDirectory LIKE 'https://%'
+    BEGIN
+      SET @URL = @DefaultDirectory
+    END
+    ELSE
+    BEGIN
+      INSERT INTO @Directories (ID, DirectoryPath, Mirror, Completed)
+      SELECT 1, @DefaultDirectory, 0, 0
+    END
   END
   IF @Directory IS NULL AND @URL IS NULL AND @HostPlatform = 'Linux'
   BEGIN
@@ -955,7 +937,7 @@ BEGIN
 
   SET @DirectoryCheck = 1
 
-  IF EXISTS(SELECT * FROM @Directories WHERE Mirror = 0 AND (NOT (DirectoryPath LIKE '_:' OR DirectoryPath LIKE '_:\%' OR DirectoryPath LIKE '\\%\%' OR (DirectoryPath LIKE '/%/%' AND @HostPlatform = 'Linux') OR (DirectoryPath LIKE '.' AND @HostPlatform = 'Linux')) OR DirectoryPath IS NULL OR LEFT(DirectoryPath,1) = ' ' OR RIGHT(DirectoryPath,1) = ' ')) OR EXISTS (SELECT * FROM @Directories GROUP BY DirectoryPath HAVING COUNT(*) <> 1) OR ((SELECT COUNT(*) FROM @Directories WHERE Mirror = 0) <> (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1) AND (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1) > 0)
+  IF EXISTS(SELECT * FROM @Directories WHERE Mirror = 0 AND (NOT (DirectoryPath LIKE '_:' OR DirectoryPath LIKE '_:\%' OR DirectoryPath LIKE '\\%\%' OR (DirectoryPath LIKE '/%/%' AND @HostPlatform = 'Linux') OR (DirectoryPath LIKE '.' AND @HostPlatform = 'Linux')) OR DirectoryPath IS NULL OR LEFT(DirectoryPath,1) = ' ' OR RIGHT(DirectoryPath,1) = ' ')) OR EXISTS (SELECT * FROM @Directories GROUP BY DirectoryPath HAVING COUNT(*) <> 1) OR ((SELECT COUNT(*) FROM @Directories WHERE Mirror = 0) <> (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1) AND (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1) > 0) OR (@Directory IS NOT NULL AND SERVERPROPERTY('EngineEdition') = 8)
   BEGIN
     SET @ErrorMessage = 'The value for the parameter @Directory is not supported.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
@@ -963,7 +945,7 @@ BEGIN
     SET @DirectoryCheck = 0
   END
 
-  IF EXISTS(SELECT * FROM @Directories WHERE Mirror = 1 AND (NOT (DirectoryPath LIKE '_:' OR DirectoryPath LIKE '_:\%' OR DirectoryPath LIKE '\\%\%' OR (DirectoryPath LIKE '/%/%' AND @HostPlatform = 'Linux') OR (DirectoryPath LIKE '.' AND @HostPlatform = 'Linux')) OR DirectoryPath IS NULL OR LEFT(DirectoryPath,1) = ' ' OR RIGHT(DirectoryPath,1) = ' ')) OR EXISTS (SELECT * FROM @Directories GROUP BY DirectoryPath HAVING COUNT(*) <> 1) OR ((SELECT COUNT(*) FROM @Directories WHERE Mirror = 0) <> (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1) AND (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1) > 0) OR (@BackupSoftware IN('SQLBACKUP','SQLSAFE') AND (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1) > 1) OR (@BackupSoftware IS NULL AND EXISTS(SELECT * FROM @Directories WHERE Mirror = 1) AND SERVERPROPERTY('EngineEdition') <> 3)
+  IF EXISTS(SELECT * FROM @Directories WHERE Mirror = 1 AND (NOT (DirectoryPath LIKE '_:' OR DirectoryPath LIKE '_:\%' OR DirectoryPath LIKE '\\%\%' OR (DirectoryPath LIKE '/%/%' AND @HostPlatform = 'Linux') OR (DirectoryPath LIKE '.' AND @HostPlatform = 'Linux')) OR DirectoryPath IS NULL OR LEFT(DirectoryPath,1) = ' ' OR RIGHT(DirectoryPath,1) = ' ')) OR EXISTS (SELECT * FROM @Directories GROUP BY DirectoryPath HAVING COUNT(*) <> 1) OR ((SELECT COUNT(*) FROM @Directories WHERE Mirror = 0) <> (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1) AND (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1) > 0) OR (@BackupSoftware IN('SQLBACKUP','SQLSAFE') AND (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1) > 1) OR (@BackupSoftware IS NULL AND EXISTS(SELECT * FROM @Directories WHERE Mirror = 1) AND SERVERPROPERTY('EngineEdition') <> 3) OR (@MirrorDirectory IS NOT NULL AND SERVERPROPERTY('EngineEdition') = 8)
   BEGIN
     SET @ErrorMessage = 'The value for the parameter @MirrorDirectory is not supported.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
@@ -973,13 +955,18 @@ BEGIN
 
   IF @DirectoryCheck = 1
   BEGIN
-    WHILE EXISTS(SELECT * FROM @Directories WHERE Completed = 0)
+    WHILE (1 = 1)
     BEGIN
       SELECT TOP 1 @CurrentRootDirectoryID = ID,
                    @CurrentRootDirectoryPath = DirectoryPath
       FROM @Directories
       WHERE Completed = 0
       ORDER BY ID ASC
+
+      IF @@ROWCOUNT = 0
+      BEGIN
+        BREAK
+      END
 
       INSERT INTO @DirectoryInfo (FileExists, FileIsADirectory, ParentDirectoryExists)
       EXECUTE [master].dbo.xp_fileexist @CurrentRootDirectoryPath
@@ -1036,6 +1023,13 @@ BEGIN
     SET @Error = @@ERROR
   END
 
+  IF SERVERPROPERTY('EngineEdition') = 8 AND NOT (@BackupType = 'FULL' AND @CopyOnly = 'Y')
+  BEGIN
+    SET @ErrorMessage = 'SQL Database Managed Instance only supports COPY_ONLY full backups.' + CHAR(13) + CHAR(10) + ' '
+    RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
+    SET @Error = @@ERROR
+  END
+
   IF @Verify NOT IN ('Y','N') OR @Verify IS NULL OR (@BackupSoftware = 'SQLSAFE' AND @Encrypt = 'Y' AND @Verify = 'Y')
   BEGIN
     SET @ErrorMessage = 'The value for the parameter @Verify is not supported.' + CHAR(13) + CHAR(10) + ' '
@@ -1057,7 +1051,7 @@ BEGIN
     SET @Error = @@ERROR
   END
 
-  IF @Compress NOT IN ('Y','N') OR @Compress IS NULL OR (@Compress = 'Y' AND @BackupSoftware IS NULL AND NOT ((@Version >= 10 AND @Version < 10.5 AND SERVERPROPERTY('EngineEdition') = 3) OR (@Version >= 10.5 AND (SERVERPROPERTY('EngineEdition') = 3 OR SERVERPROPERTY('EditionID') IN (-1534726760, 284895786))))) OR (@Compress = 'N' AND @BackupSoftware IS NOT NULL AND (@CompressionLevel IS NULL OR @CompressionLevel >= 1)) OR (@Compress = 'Y' AND @BackupSoftware IS NOT NULL AND @CompressionLevel = 0)
+  IF @Compress NOT IN ('Y','N') OR @Compress IS NULL OR (@Compress = 'Y' AND @BackupSoftware IS NULL AND NOT ((@Version >= 10 AND @Version < 10.5 AND SERVERPROPERTY('EngineEdition') = 3) OR (@Version >= 10.5 AND (SERVERPROPERTY('EngineEdition') IN (3, 8) OR SERVERPROPERTY('EditionID') IN (-1534726760, 284895786))))) OR (@Compress = 'N' AND @BackupSoftware IS NOT NULL AND (@CompressionLevel IS NULL OR @CompressionLevel >= 1)) OR (@Compress = 'Y' AND @BackupSoftware IS NOT NULL AND @CompressionLevel = 0)
   BEGIN
     SET @ErrorMessage = 'The value for the parameter @Compress is not supported.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
@@ -1087,14 +1081,14 @@ BEGIN
 
   IF @BackupSoftware = 'LITESPEED' AND NOT EXISTS (SELECT * FROM [master].sys.objects WHERE [type] = 'X' AND [name] = 'xp_backup_database')
   BEGIN
-    SET @ErrorMessage = 'LiteSpeed for SQL Server is not installed. Download http://software.dell.com/products/litespeed-for-sql-server/.' + CHAR(13) + CHAR(10) + ' '
+    SET @ErrorMessage = 'LiteSpeed for SQL Server is not installed. Download https://www.quest.com/products/litespeed-for-sql-server/.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
     SET @Error = @@ERROR
   END
 
   IF @BackupSoftware = 'SQLBACKUP' AND NOT EXISTS (SELECT * FROM [master].sys.objects WHERE [type] = 'X' AND [name] = 'sqlbackup')
   BEGIN
-    SET @ErrorMessage = 'Red Gate SQL Backup Pro is not installed. Download http://www.red-gate.com/products/dba/sql-backup/.' + CHAR(13) + CHAR(10) + ' '
+    SET @ErrorMessage = 'Red Gate SQL Backup Pro is not installed. Download https://www.red-gate.com/products/dba/sql-backup/.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
     SET @Error = @@ERROR
   END
@@ -1232,7 +1226,7 @@ BEGIN
     SET @Error = @@ERROR
   END
 
-  IF (@Credential IS NULL AND @URL IS NOT NULL AND @Version < 13) OR (@Credential IS NOT NULL AND @URL IS NULL) OR (@URL IS NOT NULL AND @Credential IS NULL AND NOT EXISTS(SELECT * FROM sys.credentials WHERE credential_identity = 'SHARED ACCESS SIGNATURE')) OR (@Credential IS NOT NULL AND NOT EXISTS(SELECT * FROM sys.credentials WHERE name = @Credential))
+  IF (@Credential IS NULL AND @URL IS NOT NULL AND NOT (@Version >= 13 OR SERVERPROPERTY('EngineEdition') = 8)) OR (@Credential IS NOT NULL AND @URL IS NULL) OR (@URL IS NOT NULL AND @Credential IS NULL AND NOT EXISTS(SELECT * FROM sys.credentials WHERE credential_identity = 'SHARED ACCESS SIGNATURE')) OR (@Credential IS NOT NULL AND NOT EXISTS(SELECT * FROM sys.credentials WHERE name = @Credential))
   BEGIN
     SET @ErrorMessage = 'The value for the parameter @Credential is not supported.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
@@ -1256,6 +1250,34 @@ BEGIN
   IF @Updateability NOT IN('READ_ONLY','READ_WRITE','ALL') OR @Updateability IS NULL
   BEGIN
     SET @ErrorMessage = 'The value for the parameter @Updateability is not supported.' + CHAR(13) + CHAR(10) + ' '
+    RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
+    SET @Error = @@ERROR
+  END
+
+  IF @AdaptiveCompression NOT IN('SIZE','SPEED') OR (@AdaptiveCompression IS NOT NULL AND (@BackupSoftware NOT IN('LITESPEED') OR @BackupSoftware IS NULL))
+  BEGIN
+    SET @ErrorMessage = 'The value for the parameter @AdaptiveCompression is not supported.' + CHAR(13) + CHAR(10) + ' '
+    RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
+    SET @Error = @@ERROR
+  END
+
+  IF (@ModificationLevel IS NOT NULL AND NOT (@Version >= 13.05026)) OR (@ModificationLevel IS NOT NULL AND @ChangeBackupType = 'N') OR (@ModificationLevel IS NOT NULL AND @BackupType <> 'DIFF')
+  BEGIN
+    SET @ErrorMessage = 'The value for the parameter @ModificationLevel is not supported.' + CHAR(13) + CHAR(10) + ' '
+    RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
+    SET @Error = @@ERROR
+  END
+
+  IF (@LogSizeSinceLastLogBackup IS NOT NULL AND NOT (@Version >= 13.05026)) OR (@LogSizeSinceLastLogBackup IS NOT NULL AND @TimeSinceLastLogBackup IS NULL) OR (@LogSizeSinceLastLogBackup IS NULL AND @TimeSinceLastLogBackup IS NOT NULL) OR (@LogSizeSinceLastLogBackup IS NOT NULL AND @BackupType <> 'LOG')
+  BEGIN
+    SET @ErrorMessage = 'The value for the parameter @LogSizeSinceLastLogBackup is not supported.' + CHAR(13) + CHAR(10) + ' '
+    RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
+    SET @Error = @@ERROR
+  END
+
+  IF (@TimeSinceLastLogBackup IS NOT NULL AND NOT (@Version >= 13.05026)) OR (@TimeSinceLastLogBackup IS NOT NULL AND @LogSizeSinceLastLogBackup IS NULL) OR (@TimeSinceLastLogBackup IS NULL AND @LogSizeSinceLastLogBackup IS NOT NULL) OR (@TimeSinceLastLogBackup IS NOT NULL AND @BackupType <> 'LOG')
+  BEGIN
+    SET @ErrorMessage = 'The value for the parameter @TimeSinceLastLogBackup is not supported.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
     SET @Error = @@ERROR
   END
@@ -1335,7 +1357,7 @@ BEGIN
   --// Execute backup commands                                                                    //--
   ----------------------------------------------------------------------------------------------------
 
-  WHILE EXISTS (SELECT * FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
+  WHILE (1 = 1)
   BEGIN
 
     SELECT TOP 1 @CurrentDBID = ID,
@@ -1345,6 +1367,11 @@ BEGIN
     WHERE Selected = 1
     AND Completed = 0
     ORDER BY ID ASC
+
+    IF @@ROWCOUNT = 0
+    BEGIN
+      BREAK
+    END
 
     SET @CurrentDatabaseID = DB_ID(@CurrentDatabaseName)
 
@@ -1358,6 +1385,23 @@ BEGIN
       BEGIN
         SET @CurrentIsDatabaseAccessible = 0
       END
+    END
+
+    IF @Version >= 11 AND @Cluster IS NOT NULL
+    BEGIN
+      SELECT @CurrentAvailabilityGroup = availability_groups.name,
+             @CurrentAvailabilityGroupRole = dm_hadr_availability_replica_states.role_desc,
+             @CurrentAvailabilityGroupBackupPreference = UPPER(availability_groups.automated_backup_preference_desc)
+      FROM sys.databases databases
+      INNER JOIN sys.availability_databases_cluster availability_databases_cluster ON databases.group_database_id = availability_databases_cluster.group_database_id
+      INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
+      INNER JOIN sys.dm_hadr_availability_replica_states dm_hadr_availability_replica_states ON availability_groups.group_id = dm_hadr_availability_replica_states.group_id AND databases.replica_id = dm_hadr_availability_replica_states.replica_id
+      WHERE databases.name = @CurrentDatabaseName
+    END
+
+    IF @Version >= 11 AND @Cluster IS NOT NULL AND @CurrentAvailabilityGroup IS NOT NULL
+    BEGIN
+      SELECT @CurrentIsPreferredBackupReplica = sys.fn_hadr_backup_is_preferred_replica(@CurrentDatabaseName)
     END
 
     SELECT @CurrentDifferentialBaseLSN = differential_base_lsn
@@ -1380,6 +1424,13 @@ BEGIN
       WHERE database_id = @CurrentDatabaseID
     END
 
+    IF DATABASEPROPERTYEX(@CurrentDatabaseName,'Status') = 'ONLINE' AND @Version >= 13.05026 AND (@CurrentAvailabilityGroupRole = 'PRIMARY' OR @CurrentAvailabilityGroupRole IS NULL)
+    BEGIN
+      SET @CurrentCommand07 = 'SELECT @ParamAllocatedExtentPageCount = SUM(allocated_extent_page_count), @ParamModifiedExtentPageCount = SUM(modified_extent_page_count) FROM ' + QUOTENAME(@CurrentDatabaseName) + '.sys.dm_db_file_space_usage'
+
+      EXECUTE sp_executesql @statement = @CurrentCommand07, @params = N'@ParamAllocatedExtentPageCount bigint OUTPUT, @ParamModifiedExtentPageCount bigint OUTPUT', @ParamAllocatedExtentPageCount = @CurrentAllocatedExtentPageCount OUTPUT, @ParamModifiedExtentPageCount = @CurrentModifiedExtentPageCount OUTPUT
+    END
+
     SET @CurrentBackupType = @BackupType
 
     IF @ChangeBackupType = 'Y'
@@ -1388,20 +1439,17 @@ BEGIN
       BEGIN
         SET @CurrentBackupType = 'DIFF'
       END
-      IF @CurrentBackupType = 'DIFF' AND @CurrentDifferentialBaseLSN IS NULL AND @CurrentDatabaseName <> 'master'
+      IF @CurrentBackupType = 'DIFF' AND @CurrentDatabaseName <> 'master' AND (@CurrentDifferentialBaseLSN IS NULL OR (@CurrentModifiedExtentPageCount * 1. / @CurrentAllocatedExtentPageCount * 100 >= @ModificationLevel))
       BEGIN
         SET @CurrentBackupType = 'FULL'
       END
     END
 
-    IF @CurrentBackupType = 'LOG' AND (@CleanupTime IS NOT NULL OR @MirrorCleanupTime IS NOT NULL)
+    IF DATABASEPROPERTYEX(@CurrentDatabaseName,'Status') = 'ONLINE' AND @Version >= 13.05026
     BEGIN
-      SELECT @CurrentLatestBackup = MAX(backup_finish_date)
-      FROM msdb.dbo.backupset
-      WHERE ([type] IN('D','I')
-      OR database_backup_lsn < @CurrentDifferentialBaseLSN)
-      AND is_damaged = 0
-      AND database_name = @CurrentDatabaseName
+      SELECT @CurrentLastLogBackup = log_backup_time,
+             @CurrentLogSizeSinceLastLogBackup = log_since_last_log_backup_mb
+      FROM sys.dm_db_log_stats (@CurrentDatabaseID)
     END
 
     IF @CurrentBackupType = 'DIFF'
@@ -1411,23 +1459,6 @@ BEGIN
       WHERE database_name = @CurrentDatabaseName
       AND [type] = 'D'
       AND checkpoint_lsn = @CurrentDifferentialBaseLSN
-    END
-
-    IF @Version >= 11 AND @Cluster IS NOT NULL
-    BEGIN
-      SELECT @CurrentAvailabilityGroup = availability_groups.name,
-             @CurrentAvailabilityGroupRole = dm_hadr_availability_replica_states.role_desc,
-             @CurrentAvailabilityGroupBackupPreference = UPPER(availability_groups.automated_backup_preference_desc)
-      FROM sys.databases databases
-      INNER JOIN sys.availability_databases_cluster availability_databases_cluster ON databases.group_database_id = availability_databases_cluster.group_database_id
-      INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
-      INNER JOIN sys.dm_hadr_availability_replica_states dm_hadr_availability_replica_states ON availability_groups.group_id = dm_hadr_availability_replica_states.group_id AND databases.replica_id = dm_hadr_availability_replica_states.replica_id
-      WHERE databases.name = @CurrentDatabaseName
-    END
-
-    IF @Version >= 11 AND @Cluster IS NOT NULL AND @CurrentAvailabilityGroup IS NOT NULL
-    BEGIN
-      SELECT @CurrentIsPreferredBackupReplica = sys.fn_hadr_backup_is_preferred_replica(@CurrentDatabaseName)
     END
 
     SELECT @CurrentDatabaseMirroringRole = UPPER(mirroring_role_desc)
@@ -1524,6 +1555,24 @@ BEGIN
     SET @DatabaseMessage = 'Last log backup LSN: ' + ISNULL(CAST(@CurrentLogLSN AS nvarchar),'N/A')
     RAISERROR(@DatabaseMessage,10,1) WITH NOWAIT
 
+    IF @CurrentBackupType IN('DIFF','FULL') AND @Version >= 13.05026
+    BEGIN
+      SET @DatabaseMessage = 'Allocated extent page count: ' + ISNULL(CAST(@CurrentAllocatedExtentPageCount AS nvarchar),'N/A')
+      RAISERROR(@DatabaseMessage,10,1) WITH NOWAIT
+
+      SET @DatabaseMessage = 'Modified extent page count: ' + ISNULL(CAST(@CurrentModifiedExtentPageCount AS nvarchar),'N/A')
+      RAISERROR(@DatabaseMessage,10,1) WITH NOWAIT
+    END
+
+    IF @CurrentBackupType = 'LOG' AND @Version >= 13.05026
+    BEGIN
+      SET @DatabaseMessage = 'Last log backup: ' + ISNULL(CONVERT(nvarchar(19),@CurrentLastLogBackup,120),'N/A')
+      RAISERROR(@DatabaseMessage,10,1) WITH NOWAIT
+
+      SET @DatabaseMessage = 'Log size since last log backup (MB): ' + ISNULL(CAST(@CurrentLogSizeSinceLastLogBackup AS nvarchar),'N/A')
+      RAISERROR(@DatabaseMessage,10,1) WITH NOWAIT
+    END
+
     RAISERROR('',10,1) WITH NOWAIT
 
     IF DATABASEPROPERTYEX(@CurrentDatabaseName,'Status') = 'ONLINE'
@@ -1540,9 +1589,19 @@ BEGIN
     AND NOT ((@CurrentLogShippingRole = 'PRIMARY' AND @CurrentLogShippingRole IS NOT NULL) AND @CurrentBackupType = 'LOG')
     AND NOT (@CurrentIsReadOnly = 1 AND @Updateability = 'READ_WRITE')
     AND NOT (@CurrentIsReadOnly = 0 AND @Updateability = 'READ_ONLY')
+    AND NOT (@CurrentBackupType = 'LOG' AND @LogSizeSinceLastLogBackup IS NOT NULL AND @TimeSinceLastLogBackup IS NOT NULL AND NOT(@CurrentLogSizeSinceLastLogBackup >= @LogSizeSinceLastLogBackup OR @CurrentLogSizeSinceLastLogBackup IS NULL OR DATEDIFF(SECOND,@CurrentLastLogBackup,GETDATE()) >= @TimeSinceLastLogBackup OR @CurrentLastLogBackup IS NULL))
     BEGIN
 
-      -- Set variables
+      IF @CurrentBackupType = 'LOG' AND (@CleanupTime IS NOT NULL OR @MirrorCleanupTime IS NOT NULL)
+      BEGIN
+        SELECT @CurrentLatestBackup = MAX(backup_finish_date)
+        FROM msdb.dbo.backupset
+        WHERE ([type] IN('D','I')
+        OR database_backup_lsn < @CurrentDifferentialBaseLSN)
+        AND is_damaged = 0
+        AND database_name = @CurrentDatabaseName
+      END
+
       SET @CurrentDate = GETDATE()
 
       INSERT INTO @CurrentCleanupDates (CleanupDate)
@@ -1684,34 +1743,42 @@ BEGIN
       END
 
       -- Create directory
-      WHILE EXISTS (SELECT * FROM @CurrentDirectories WHERE CreateCompleted = 0) AND @HostPlatform = 'Windows'
+      IF @HostPlatform = 'Windows'
       BEGIN
-        SELECT TOP 1 @CurrentDirectoryID = ID,
-                     @CurrentDirectoryPath = DirectoryPath
-        FROM @CurrentDirectories
-        WHERE CreateCompleted = 0
-        ORDER BY ID ASC
+        WHILE (1 = 1)
+        BEGIN
+          SELECT TOP 1 @CurrentDirectoryID = ID,
+                       @CurrentDirectoryPath = DirectoryPath
+          FROM @CurrentDirectories
+          WHERE CreateCompleted = 0
+          ORDER BY ID ASC
 
-        SET @CurrentCommandType01 = 'xp_create_subdir'
-        SET @CurrentCommand01 = 'DECLARE @ReturnCode int EXECUTE @ReturnCode = [master].dbo.xp_create_subdir N''' + REPLACE(@CurrentDirectoryPath,'''','''''') + ''' IF @ReturnCode <> 0 RAISERROR(''Error creating directory.'', 16, 1)'
-        EXECUTE @CurrentCommandOutput01 = [dbo].[CommandExecute] @Command = @CurrentCommand01, @CommandType = @CurrentCommandType01, @Mode = 1, @DatabaseName = @CurrentDatabaseName, @LogToTable = @LogToTable, @Execute = @Execute
-        SET @Error = @@ERROR
-        IF @Error <> 0 SET @CurrentCommandOutput01 = @Error
-        IF @CurrentCommandOutput01 <> 0 SET @ReturnCode = @CurrentCommandOutput01
+          IF @@ROWCOUNT = 0
+          BEGIN
+            BREAK
+          END
 
-        UPDATE @CurrentDirectories
-        SET CreateCompleted = 1,
-            CreateOutput = @CurrentCommandOutput01
-        WHERE ID = @CurrentDirectoryID
+          SET @CurrentCommandType01 = 'xp_create_subdir'
+          SET @CurrentCommand01 = 'DECLARE @ReturnCode int EXECUTE @ReturnCode = [master].dbo.xp_create_subdir N''' + REPLACE(@CurrentDirectoryPath,'''','''''') + ''' IF @ReturnCode <> 0 RAISERROR(''Error creating directory.'', 16, 1)'
+          EXECUTE @CurrentCommandOutput01 = [dbo].[CommandExecute] @Command = @CurrentCommand01, @CommandType = @CurrentCommandType01, @Mode = 1, @DatabaseName = @CurrentDatabaseName, @LogToTable = @LogToTable, @Execute = @Execute
+          SET @Error = @@ERROR
+          IF @Error <> 0 SET @CurrentCommandOutput01 = @Error
+          IF @CurrentCommandOutput01 <> 0 SET @ReturnCode = @CurrentCommandOutput01
 
-        SET @CurrentDirectoryID = NULL
-        SET @CurrentDirectoryPath = NULL
+          UPDATE @CurrentDirectories
+          SET CreateCompleted = 1,
+              CreateOutput = @CurrentCommandOutput01
+          WHERE ID = @CurrentDirectoryID
 
-        SET @CurrentCommand01 = NULL
+          SET @CurrentDirectoryID = NULL
+          SET @CurrentDirectoryPath = NULL
 
-        SET @CurrentCommandOutput01 = NULL
+          SET @CurrentCommand01 = NULL
 
-        SET @CurrentCommandType01 = NULL
+          SET @CurrentCommandOutput01 = NULL
+
+          SET @CurrentCommandType01 = NULL
+        END
       END
 
       IF @CleanupMode = 'BEFORE_BACKUP'
@@ -1751,15 +1818,21 @@ BEGIN
       AND @HostPlatform = 'Windows'
       AND @CurrentBackupType = @BackupType
       BEGIN
-        WHILE EXISTS (SELECT * FROM @CurrentDirectories WHERE CleanupDate IS NOT NULL AND CleanupMode = 'BEFORE_BACKUP' AND CleanupCompleted = 0)
+        WHILE (1 = 1)
         BEGIN
           SELECT TOP 1 @CurrentDirectoryID = ID,
                        @CurrentDirectoryPath = DirectoryPath,
                        @CurrentCleanupDate = CleanupDate
           FROM @CurrentDirectories
           WHERE CleanupDate IS NOT NULL
+          AND CleanupMode = 'BEFORE_BACKUP'
           AND CleanupCompleted = 0
           ORDER BY ID ASC
+
+          IF @@ROWCOUNT = 0
+          BEGIN
+            BREAK
+          END
 
           IF @BackupSoftware IS NULL
           BEGIN
@@ -1909,6 +1982,7 @@ BEGIN
           SET @CurrentCommand03 = @CurrentCommand03 + ''''
           IF @ReadWriteFileGroups = 'Y' AND @CurrentDatabaseName <> 'master' SET @CurrentCommand03 = @CurrentCommand03 + ', @read_write_filegroups = 1'
           IF @CompressionLevel IS NOT NULL SET @CurrentCommand03 = @CurrentCommand03 + ', @compressionlevel = ' + CAST(@CompressionLevel AS nvarchar)
+          IF @AdaptiveCompression IS NOT NULL SET @CurrentCommand03 = @CurrentCommand03 + ', @adaptivecompression = ''' + CASE WHEN @AdaptiveCompression = 'SIZE' THEN 'Size' WHEN @AdaptiveCompression = 'SPEED' THEN 'Speed' END + ''''
           IF @BufferCount IS NOT NULL SET @CurrentCommand03 = @CurrentCommand03 + ', @buffercount = ' + CAST(@BufferCount AS nvarchar)
           IF @MaxTransferSize IS NOT NULL SET @CurrentCommand03 = @CurrentCommand03 + ', @maxtransfersize = ' + CAST(@MaxTransferSize AS nvarchar)
           IF @Threads IS NOT NULL SET @CurrentCommand03 = @CurrentCommand03 + ', @threads = ' + CAST(@Threads AS nvarchar)
@@ -2018,13 +2092,18 @@ BEGIN
       -- Verify the backup
       IF @CurrentCommandOutput03 = 0 AND @Verify = 'Y'
       BEGIN
-      WHILE EXISTS (SELECT * FROM @CurrentBackupSet WHERE VerifyCompleted = 0)
+        WHILE (1 = 1)
         BEGIN
           SELECT TOP 1 @CurrentBackupSetID = ID,
                        @CurrentIsMirror = Mirror
           FROM @CurrentBackupSet
           WHERE VerifyCompleted = 0
           ORDER BY ID ASC
+
+          IF @@ROWCOUNT = 0
+          BEGIN
+            BREAK
+          END
 
           IF @BackupSoftware IS NULL
           BEGIN
@@ -2155,15 +2234,21 @@ BEGIN
       AND @HostPlatform = 'Windows'
       AND @CurrentBackupType = @BackupType
       BEGIN
-        WHILE EXISTS (SELECT * FROM @CurrentDirectories WHERE CleanupDate IS NOT NULL AND CleanupMode = 'AFTER_BACKUP' AND CleanupCompleted = 0)
+        WHILE (1 = 1)
         BEGIN
           SELECT TOP 1 @CurrentDirectoryID = ID,
                        @CurrentDirectoryPath = DirectoryPath,
                        @CurrentCleanupDate = CleanupDate
           FROM @CurrentDirectories
           WHERE CleanupDate IS NOT NULL
+          AND CleanupMode = 'AFTER_BACKUP'
           AND CleanupCompleted = 0
           ORDER BY ID ASC
+
+          IF @@ROWCOUNT = 0
+          BEGIN
+            BREAK
+          END
 
           IF @BackupSoftware IS NULL
           BEGIN
@@ -2253,9 +2338,14 @@ BEGIN
     SET @CurrentLogShippingRole = NULL
     SET @CurrentIsEncrypted = NULL
     SET @CurrentIsReadOnly = NULL
+    SET @CurrentLastLogBackup = NULL
+    SET @CurrentLogSizeSinceLastLogBackup = NULL
+    SET @CurrentAllocatedExtentPageCount = NULL
+    SET @CurrentModifiedExtentPageCount = NULL
 
     SET @CurrentCommand03 = NULL
     SET @CurrentCommand06 = NULL
+    SET @CurrentCommand07 = NULL
 
     SET @CurrentCommandOutput03 = NULL
 
@@ -2328,7 +2418,13 @@ BEGIN
   DECLARE @DatabaseMessage nvarchar(max)
   DECLARE @ErrorMessage nvarchar(max)
 
+  DECLARE @StartTime datetime
+  DECLARE @SchemaName nvarchar(max)
+  DECLARE @ObjectName nvarchar(max)
+  DECLARE @Parameters nvarchar(max)
+
   DECLARE @Version numeric(18,10)
+  DECLARE @HostPlatform nvarchar(max)
   DECLARE @AmazonRDS bit
 
   DECLARE @Cluster nvarchar(max)
@@ -2436,13 +2532,43 @@ BEGIN
 
   SET @Version = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - 1) + '.' + REPLACE(RIGHT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)), LEN(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)))),'.','') AS numeric(18,10))
 
+  IF @Version >= 14
+  BEGIN
+    SELECT @HostPlatform = host_platform
+    FROM sys.dm_os_host_info
+  END
+  ELSE
+  BEGIN
+    SET @HostPlatform = 'Windows'
+  END
+
   SET @AmazonRDS = CASE WHEN DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa' THEN 1 ELSE 0 END
 
   ----------------------------------------------------------------------------------------------------
   --// Log initial information                                                                    //--
   ----------------------------------------------------------------------------------------------------
 
-  SET @StartMessage = 'Date and time: ' + CONVERT(nvarchar,GETDATE(),120)
+  SET @StartTime = GETDATE()
+  SET @SchemaName = (SELECT schemas.name FROM sys.schemas schemas INNER JOIN sys.objects objects ON schemas.[schema_id] = objects.[schema_id] WHERE [object_id] = @@PROCID)
+  SET @ObjectName = OBJECT_NAME(@@PROCID)
+
+  SET @Parameters = '@Databases = ' + ISNULL('''' + REPLACE(@Databases,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @CheckCommands = ' + ISNULL('''' + REPLACE(@CheckCommands,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @PhysicalOnly = ' + ISNULL('''' + REPLACE(@PhysicalOnly,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @NoIndex = ' + ISNULL('''' + REPLACE(@NoIndex,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @ExtendedLogicalChecks = ' + ISNULL('''' + REPLACE(@ExtendedLogicalChecks,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @TabLock = ' + ISNULL('''' + REPLACE(@TabLock,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @FileGroups = ' + ISNULL('''' + REPLACE(@FileGroups,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Objects = ' + ISNULL('''' + REPLACE(@Objects,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @MaxDOP = ' + ISNULL(CAST(@MaxDOP AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @AvailabilityGroups = ' + ISNULL('''' + REPLACE(@AvailabilityGroups,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @AvailabilityGroupReplicas = ' + ISNULL('''' + REPLACE(@AvailabilityGroupReplicas,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Updateability = ' + ISNULL('''' + REPLACE(@Updateability,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @LockTimeout = ' + ISNULL(CAST(@LockTimeout AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
+
+  SET @StartMessage = 'Date and time: ' + CONVERT(nvarchar,@StartTime,120)
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
   SET @StartMessage = 'Server: ' + CAST(SERVERPROPERTY('ServerName') AS nvarchar(max))
@@ -2454,24 +2580,13 @@ BEGIN
   SET @StartMessage = 'Edition: ' + CAST(SERVERPROPERTY('Edition') AS nvarchar(max))
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
-  SET @StartMessage = 'Procedure: ' + QUOTENAME(DB_NAME(DB_ID())) + '.' + (SELECT QUOTENAME(schemas.name) FROM sys.schemas schemas INNER JOIN sys.objects objects ON schemas.[schema_id] = objects.[schema_id] WHERE [object_id] = @@PROCID) + '.' + QUOTENAME(OBJECT_NAME(@@PROCID))
+  SET @StartMessage = 'Platform: ' + @HostPlatform
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
-  SET @StartMessage = 'Parameters: @Databases = ' + ISNULL('''' + REPLACE(@Databases,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @CheckCommands = ' + ISNULL('''' + REPLACE(@CheckCommands,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @PhysicalOnly = ' + ISNULL('''' + REPLACE(@PhysicalOnly,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @NoIndex = ' + ISNULL('''' + REPLACE(@NoIndex,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @ExtendedLogicalChecks = ' + ISNULL('''' + REPLACE(@ExtendedLogicalChecks,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @TabLock = ' + ISNULL('''' + REPLACE(@TabLock,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @FileGroups = ' + ISNULL('''' + REPLACE(@FileGroups,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Objects = ' + ISNULL('''' + REPLACE(@Objects,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @MaxDOP = ' + ISNULL(CAST(@MaxDOP AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @AvailabilityGroups = ' + ISNULL('''' + REPLACE(@AvailabilityGroups,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @AvailabilityGroupReplicas = ' + ISNULL('''' + REPLACE(@AvailabilityGroupReplicas,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Updateability = ' + ISNULL('''' + REPLACE(@Updateability,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @LockTimeout = ' + ISNULL(CAST(@LockTimeout AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
+  SET @StartMessage = 'Procedure: ' + QUOTENAME(DB_NAME(DB_ID())) + '.' + QUOTENAME(@SchemaName) + '.' + QUOTENAME(@ObjectName)
+  RAISERROR(@StartMessage,10,1) WITH NOWAIT
+
+  SET @StartMessage = 'Parameters: ' + @Parameters
   SET @StartMessage = REPLACE(@StartMessage,'%','%%')
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
@@ -2571,30 +2686,32 @@ BEGIN
   FROM Databases4
   OPTION (MAXRECURSION 0)
 
-  IF @Version >= 11 AND SERVERPROPERTY('EngineEdition') <> 5
+  IF @Version >= 11
   BEGIN
-    INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, [Snapshot], Selected, Completed)
-    SELECT [name] AS DatabaseName,
-           CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
-           CASE WHEN name IN (SELECT availability_databases_cluster.database_name FROM sys.availability_databases_cluster availability_databases_cluster INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id) THEN 1 ELSE 0 END AS AvailabilityGroup,
-           CASE WHEN source_database_id IS NOT NULL THEN 1 ELSE 0 END AS [Snapshot],
-           0 AS Selected,
-           0 AS Completed
-    FROM sys.databases
-    ORDER BY [name] ASC
+    INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
+    SELECT name AS AvailabilityGroupName,
+            0 AS Selected
+    FROM sys.availability_groups
+
+    INSERT INTO @tmpDatabasesAvailabilityGroups (DatabaseName, AvailabilityGroupName)
+    SELECT availability_databases_cluster.database_name, availability_groups.name
+    FROM sys.availability_databases_cluster availability_databases_cluster
+    INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
   END
-  ELSE
-  BEGIN
-    INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, [Snapshot], Selected, Completed)
-    SELECT [name] AS DatabaseName,
-           CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
-           NULL AS AvailabilityGroup,
-           CASE WHEN source_database_id IS NOT NULL THEN 1 ELSE 0 END AS [Snapshot],
-           0 AS Selected,
-           0 AS Completed
-    FROM sys.databases
-    ORDER BY [name] ASC
-  END
+
+  INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, [Snapshot], Selected, Completed)
+  SELECT [name] AS DatabaseName,
+          CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
+          NULL AS AvailabilityGroup,
+          CASE WHEN source_database_id IS NOT NULL THEN 1 ELSE 0 END AS [Snapshot],
+          0 AS Selected,
+          0 AS Completed
+  FROM sys.databases
+  ORDER BY [name] ASC
+
+  UPDATE tmpDatabases
+  SET AvailabilityGroup = CASE WHEN EXISTS (SELECT * FROM @tmpDatabasesAvailabilityGroups WHERE DatabaseName = tmpDatabases.DatabaseName) THEN 1 ELSE 0 END
+  FROM @tmpDatabases tmpDatabases
 
   UPDATE tmpDatabases
   SET tmpDatabases.Selected = SelectedDatabases.Selected
@@ -2674,11 +2791,6 @@ BEGIN
     FROM AvailabilityGroups4
     OPTION (MAXRECURSION 0)
 
-    INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
-    SELECT name AS AvailabilityGroupName,
-           0 AS Selected
-    FROM sys.availability_groups
-
     UPDATE tmpAvailabilityGroups
     SET tmpAvailabilityGroups.Selected = SelectedAvailabilityGroups.Selected
     FROM @tmpAvailabilityGroups tmpAvailabilityGroups
@@ -2692,11 +2804,6 @@ BEGIN
     INNER JOIN @SelectedAvailabilityGroups SelectedAvailabilityGroups
     ON tmpAvailabilityGroups.AvailabilityGroupName LIKE REPLACE(SelectedAvailabilityGroups.AvailabilityGroupName,'_','[_]')
     WHERE SelectedAvailabilityGroups.Selected = 0
-
-    INSERT INTO @tmpDatabasesAvailabilityGroups (DatabaseName, AvailabilityGroupName)
-    SELECT availability_databases_cluster.database_name, availability_groups.name
-    FROM sys.availability_databases_cluster availability_databases_cluster
-    INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
 
     UPDATE tmpDatabases
     SET Selected = 1
@@ -2902,7 +3009,7 @@ BEGIN
     SET @Error = @@ERROR
   END
 
-  IF @MaxDOP < 0 OR @MaxDOP > 64 OR (@MaxDOP > 1 AND SERVERPROPERTY('EngineEdition') NOT IN (3,5)) OR (@MaxDOP IS NOT NULL AND @Version < 12.050000)
+  IF @MaxDOP < 0 OR @MaxDOP > 64 OR (@MaxDOP IS NOT NULL AND NOT (@Version >= 12.050000 OR SERVERPROPERTY('EngineEdition') IN (5, 8)))
   BEGIN
     SET @ErrorMessage = 'The value for the parameter @MaxDOP is not supported.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
@@ -3044,7 +3151,7 @@ BEGIN
   --// Execute commands                                                                           //--
   ----------------------------------------------------------------------------------------------------
 
-  WHILE EXISTS (SELECT * FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
+  WHILE (1 = 1)
   BEGIN
 
     SELECT TOP 1 @CurrentDBID = ID,
@@ -3053,6 +3160,11 @@ BEGIN
     WHERE Selected = 1
     AND Completed = 0
     ORDER BY ID ASC
+
+    IF @@ROWCOUNT = 0
+    BEGIN
+     BREAK
+    END
 
     SET @CurrentDatabaseID = DB_ID(@CurrentDatabaseName)
 
@@ -3210,7 +3322,7 @@ BEGIN
           SET @Error = @@ERROR
         END
 
-        WHILE EXISTS (SELECT * FROM @tmpFileGroups WHERE Selected = 1 AND Completed = 0)
+        WHILE (1 = 1)
         BEGIN
           SELECT TOP 1 @CurrentFGID = ID,
                        @CurrentFileGroupID = FileGroupID,
@@ -3219,6 +3331,11 @@ BEGIN
           WHERE Selected = 1
           AND Completed = 0
           ORDER BY ID ASC
+
+          IF @@ROWCOUNT = 0
+          BEGIN
+            BREAK
+          END
 
           -- Does the filegroup exist?
           SET @CurrentCommand03 = ''
@@ -3342,7 +3459,7 @@ BEGIN
           SET @Error = @@ERROR
         END
 
-        WHILE EXISTS (SELECT * FROM @tmpObjects WHERE Selected = 1 AND Completed = 0)
+        WHILE (1 = 1)
         BEGIN
           SELECT TOP 1 @CurrentOID = ID,
                        @CurrentSchemaID = SchemaID,
@@ -3354,6 +3471,11 @@ BEGIN
           WHERE Selected = 1
           AND Completed = 0
           ORDER BY ID ASC
+
+          IF @@ROWCOUNT = 0
+          BEGIN
+            BREAK
+          END
 
           -- Does the object exist?
           SET @CurrentCommand07 = ''
@@ -3556,12 +3678,16 @@ BEGIN
   DECLARE @DatabaseMessage nvarchar(max)
   DECLARE @ErrorMessage nvarchar(max)
 
+  DECLARE @StartTime datetime
+  DECLARE @SchemaName nvarchar(max)
+  DECLARE @ObjectName nvarchar(max)
+  DECLARE @Parameters nvarchar(max)
+
   DECLARE @Version numeric(18,10)
+  DECLARE @HostPlatform nvarchar(max)
   DECLARE @AmazonRDS bit
 
   DECLARE @Cluster nvarchar(max)
-
-  DECLARE @StartTime datetime
 
   DECLARE @CurrentDBID int
   DECLARE @CurrentDatabaseID int
@@ -3690,6 +3816,11 @@ BEGIN
 
   DECLARE @CurrentActionsAllowed TABLE ([Action] nvarchar(max))
 
+  DECLARE @CurrentUpdateStatisticsWithClauseArguments TABLE (ID int IDENTITY,
+                                                             Argument nvarchar(max))
+
+  DECLARE @CurrentUpdateStatisticsWithClause nvarchar(max)
+
   DECLARE @Error int
   DECLARE @ReturnCode int
 
@@ -3698,13 +3829,53 @@ BEGIN
 
   SET @Version = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - 1) + '.' + REPLACE(RIGHT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)), LEN(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)))),'.','') AS numeric(18,10))
 
+  IF @Version >= 14
+  BEGIN
+    SELECT @HostPlatform = host_platform
+    FROM sys.dm_os_host_info
+  END
+  ELSE
+  BEGIN
+    SET @HostPlatform = 'Windows'
+  END
+
   SET @AmazonRDS = CASE WHEN DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa' THEN 1 ELSE 0 END
 
   ----------------------------------------------------------------------------------------------------
   --// Log initial information                                                                    //--
   ----------------------------------------------------------------------------------------------------
 
-  SET @StartTime = CONVERT(datetime,CONVERT(nvarchar,GETDATE(),120),120)
+  SET @StartTime = GETDATE()
+  SET @SchemaName = (SELECT schemas.name FROM sys.schemas schemas INNER JOIN sys.objects objects ON schemas.[schema_id] = objects.[schema_id] WHERE [object_id] = @@PROCID)
+  SET @ObjectName = OBJECT_NAME(@@PROCID)
+
+  SET @Parameters = '@Databases = ' + ISNULL('''' + REPLACE(@Databases,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @FragmentationLow = ' + ISNULL('''' + REPLACE(@FragmentationLow,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @FragmentationMedium = ' + ISNULL('''' + REPLACE(@FragmentationMedium,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @FragmentationHigh = ' + ISNULL('''' + REPLACE(@FragmentationHigh,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @FragmentationLevel1 = ' + ISNULL(CAST(@FragmentationLevel1 AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @FragmentationLevel2 = ' + ISNULL(CAST(@FragmentationLevel2 AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @PageCountLevel = ' + ISNULL(CAST(@PageCountLevel AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @SortInTempdb = ' + ISNULL('''' + REPLACE(@SortInTempdb,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @MaxDOP = ' + ISNULL(CAST(@MaxDOP AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @FillFactor = ' + ISNULL(CAST(@FillFactor AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @PadIndex = ' + ISNULL('''' + REPLACE(@PadIndex,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @LOBCompaction = ' + ISNULL('''' + REPLACE(@LOBCompaction,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @UpdateStatistics = ' + ISNULL('''' + REPLACE(@UpdateStatistics,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @OnlyModifiedStatistics = ' + ISNULL('''' + REPLACE(@OnlyModifiedStatistics,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @StatisticsSample = ' + ISNULL(CAST(@StatisticsSample AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @StatisticsResample = ' + ISNULL('''' + REPLACE(@StatisticsResample,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @PartitionLevel = ' + ISNULL('''' + REPLACE(@PartitionLevel,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @MSShippedObjects = ' + ISNULL('''' + REPLACE(@MSShippedObjects,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Indexes = ' + ISNULL('''' + REPLACE(@Indexes,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @TimeLimit = ' + ISNULL(CAST(@TimeLimit AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @Delay = ' + ISNULL(CAST(@Delay AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @WaitAtLowPriorityMaxDuration = ' + ISNULL(CAST(@WaitAtLowPriorityMaxDuration AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @WaitAtLowPriorityAbortAfterWait = ' + ISNULL('''' + REPLACE(@WaitAtLowPriorityAbortAfterWait,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @AvailabilityGroups = ' + ISNULL('''' + REPLACE(@AvailabilityGroups,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @LockTimeout = ' + ISNULL(CAST(@LockTimeout AS nvarchar),'NULL')
+  SET @Parameters = @Parameters + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
 
   SET @StartMessage = 'Date and time: ' + CONVERT(nvarchar,@StartTime,120)
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
@@ -3718,36 +3889,13 @@ BEGIN
   SET @StartMessage = 'Edition: ' + CAST(SERVERPROPERTY('Edition') AS nvarchar(max))
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
-  SET @StartMessage = 'Procedure: ' + QUOTENAME(DB_NAME(DB_ID())) + '.' + (SELECT QUOTENAME(schemas.name) FROM sys.schemas schemas INNER JOIN sys.objects objects ON schemas.[schema_id] = objects.[schema_id] WHERE [object_id] = @@PROCID) + '.' + QUOTENAME(OBJECT_NAME(@@PROCID))
+  SET @StartMessage = 'Platform: ' + @HostPlatform
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
-  SET @StartMessage = 'Parameters: @Databases = ' + ISNULL('''' + REPLACE(@Databases,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @FragmentationLow = ' + ISNULL('''' + REPLACE(@FragmentationLow,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @FragmentationMedium = ' + ISNULL('''' + REPLACE(@FragmentationMedium,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @FragmentationHigh = ' + ISNULL('''' + REPLACE(@FragmentationHigh,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @FragmentationLevel1 = ' + ISNULL(CAST(@FragmentationLevel1 AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @FragmentationLevel2 = ' + ISNULL(CAST(@FragmentationLevel2 AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @PageCountLevel = ' + ISNULL(CAST(@PageCountLevel AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @SortInTempdb = ' + ISNULL('''' + REPLACE(@SortInTempdb,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @MaxDOP = ' + ISNULL(CAST(@MaxDOP AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @FillFactor = ' + ISNULL(CAST(@FillFactor AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @PadIndex = ' + ISNULL('''' + REPLACE(@PadIndex,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @LOBCompaction = ' + ISNULL('''' + REPLACE(@LOBCompaction,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @UpdateStatistics = ' + ISNULL('''' + REPLACE(@UpdateStatistics,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @OnlyModifiedStatistics = ' + ISNULL('''' + REPLACE(@OnlyModifiedStatistics,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @StatisticsSample = ' + ISNULL(CAST(@StatisticsSample AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @StatisticsResample = ' + ISNULL('''' + REPLACE(@StatisticsResample,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @PartitionLevel = ' + ISNULL('''' + REPLACE(@PartitionLevel,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @MSShippedObjects = ' + ISNULL('''' + REPLACE(@MSShippedObjects,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Indexes = ' + ISNULL('''' + REPLACE(@Indexes,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @TimeLimit = ' + ISNULL(CAST(@TimeLimit AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @Delay = ' + ISNULL(CAST(@Delay AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @WaitAtLowPriorityMaxDuration = ' + ISNULL(CAST(@WaitAtLowPriorityMaxDuration AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @WaitAtLowPriorityAbortAfterWait = ' + ISNULL('''' + REPLACE(@WaitAtLowPriorityAbortAfterWait,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @AvailabilityGroups = ' + ISNULL('''' + REPLACE(@AvailabilityGroups,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @LockTimeout = ' + ISNULL(CAST(@LockTimeout AS nvarchar),'NULL')
-  SET @StartMessage = @StartMessage + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
-  SET @StartMessage = @StartMessage + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
+  SET @StartMessage = 'Procedure: ' + QUOTENAME(DB_NAME(DB_ID())) + '.' + QUOTENAME(@SchemaName) + '.' + QUOTENAME(@ObjectName)
+  RAISERROR(@StartMessage,10,1) WITH NOWAIT
+
+  SET @StartMessage = 'Parameters: ' + @Parameters
   SET @StartMessage = REPLACE(@StartMessage,'%','%%')
   RAISERROR(@StartMessage,10,1) WITH NOWAIT
 
@@ -3840,32 +3988,33 @@ BEGIN
   FROM Databases4
   OPTION (MAXRECURSION 0)
 
-  IF @Version >= 11 AND SERVERPROPERTY('EngineEdition') <> 5
+  IF @Version >= 11
   BEGIN
-    INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, Selected, Completed)
-    SELECT [name] AS DatabaseName,
-           CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
-           CASE WHEN name IN (SELECT availability_databases_cluster.database_name FROM sys.availability_databases_cluster availability_databases_cluster INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id) THEN 1 ELSE 0 END AS AvailabilityGroup,
-           0 AS Selected,
-           0 AS Completed
-    FROM sys.databases
-    WHERE [name] <> 'tempdb'
-    AND source_database_id IS NULL
-    ORDER BY [name] ASC
+    INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
+    SELECT name AS AvailabilityGroupName,
+            0 AS Selected
+    FROM sys.availability_groups
+
+    INSERT INTO @tmpDatabasesAvailabilityGroups (DatabaseName, AvailabilityGroupName)
+    SELECT availability_databases_cluster.database_name, availability_groups.name
+    FROM sys.availability_databases_cluster availability_databases_cluster
+    INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
   END
-  ELSE
-  BEGIN
-    INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, Selected, Completed)
-    SELECT [name] AS DatabaseName,
-           CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
-           NULL AS AvailabilityGroup,
-           0 AS Selected,
-           0 AS Completed
-    FROM sys.databases
-    WHERE [name] <> 'tempdb'
-    AND source_database_id IS NULL
-    ORDER BY [name] ASC
-  END
+
+  INSERT INTO @tmpDatabases (DatabaseName, DatabaseType, AvailabilityGroup, Selected, Completed)
+  SELECT [name] AS DatabaseName,
+          CASE WHEN name IN('master','msdb','model') THEN 'S' ELSE 'U' END AS DatabaseType,
+          NULL AS AvailabilityGroup,
+          0 AS Selected,
+          0 AS Completed
+  FROM sys.databases
+  WHERE [name] <> 'tempdb'
+  AND source_database_id IS NULL
+  ORDER BY [name] ASC
+
+  UPDATE tmpDatabases
+  SET AvailabilityGroup = CASE WHEN EXISTS (SELECT * FROM @tmpDatabasesAvailabilityGroups WHERE DatabaseName = tmpDatabases.DatabaseName) THEN 1 ELSE 0 END
+  FROM @tmpDatabases tmpDatabases
 
   UPDATE tmpDatabases
   SET tmpDatabases.Selected = SelectedDatabases.Selected
@@ -3943,11 +4092,6 @@ BEGIN
     FROM AvailabilityGroups4
     OPTION (MAXRECURSION 0)
 
-    INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
-    SELECT name AS AvailabilityGroupName,
-           0 AS Selected
-    FROM sys.availability_groups
-
     UPDATE tmpAvailabilityGroups
     SET tmpAvailabilityGroups.Selected = SelectedAvailabilityGroups.Selected
     FROM @tmpAvailabilityGroups tmpAvailabilityGroups
@@ -3961,11 +4105,6 @@ BEGIN
     INNER JOIN @SelectedAvailabilityGroups SelectedAvailabilityGroups
     ON tmpAvailabilityGroups.AvailabilityGroupName LIKE REPLACE(SelectedAvailabilityGroups.AvailabilityGroupName,'_','[_]')
     WHERE SelectedAvailabilityGroups.Selected = 0
-
-    INSERT INTO @tmpDatabasesAvailabilityGroups (DatabaseName, AvailabilityGroupName)
-    SELECT availability_databases_cluster.database_name, availability_groups.name
-    FROM sys.availability_databases_cluster availability_databases_cluster
-    INNER JOIN sys.availability_groups availability_groups ON availability_databases_cluster.group_id = availability_groups.group_id
 
     UPDATE tmpDatabases
     SET Selected = 1
@@ -4168,7 +4307,7 @@ BEGIN
     SET @Error = @@ERROR
   END
 
-  IF @MaxDOP < 0 OR @MaxDOP > 64 OR (@MaxDOP > 1 AND SERVERPROPERTY('EngineEdition') NOT IN (3,5))
+  IF @MaxDOP < 0 OR @MaxDOP > 64
   BEGIN
     SET @ErrorMessage = 'The value for the parameter @MaxDOP is not supported.' + CHAR(13) + CHAR(10) + ' '
     RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
@@ -4369,7 +4508,7 @@ BEGIN
   --// Execute commands                                                                           //--
   ----------------------------------------------------------------------------------------------------
 
-  WHILE EXISTS (SELECT * FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
+  WHILE (1 = 1)
   BEGIN
 
     SELECT TOP 1 @CurrentDBID = ID,
@@ -4378,6 +4517,11 @@ BEGIN
     WHERE Selected = 1
     AND Completed = 0
     ORDER BY ID ASC
+
+    IF @@ROWCOUNT = 0
+    BEGIN
+      BREAK
+    END
 
     SET @CurrentDatabaseID = DB_ID(@CurrentDatabaseName)
 
@@ -4554,7 +4698,7 @@ BEGIN
         SET @Error = @@ERROR
       END
 
-      WHILE EXISTS (SELECT * FROM @tmpIndexesStatistics WHERE Selected = 1 AND Completed = 0 AND (GETDATE() < DATEADD(ss,@TimeLimit,@StartTime) OR @TimeLimit IS NULL))
+      WHILE (GETDATE() < DATEADD(ss,@TimeLimit,@StartTime) OR @TimeLimit IS NULL)
       BEGIN
 
         SELECT TOP 1 @CurrentIxID = ID,
@@ -4576,6 +4720,11 @@ BEGIN
         WHERE Selected = 1
         AND Completed = 0
         ORDER BY ID ASC
+
+        IF @@ROWCOUNT = 0
+        BEGIN
+          BREAK
+        END
 
         -- Is the index a partition?
         IF @CurrentPartitionNumber IS NULL OR @CurrentPartitionCount = 1 BEGIN SET @CurrentIsPartition = 0 END ELSE BEGIN SET @CurrentIsPartition = 1 END
@@ -4881,7 +5030,7 @@ BEGIN
           OR (@CurrentIndexType = 1 AND @CurrentIsImageText = 0 AND @CurrentIsFileStream = 0 AND @Version >= 11)
           OR (@CurrentIndexType = 2 AND @Version >= 11))
           AND (@CurrentIsColumnStore = 0 OR @Version < 11)
-          AND SERVERPROPERTY('EngineEdition') IN (3,5)
+          AND SERVERPROPERTY('EngineEdition') IN (3,5,8)
           BEGIN
             INSERT INTO @CurrentActionsAllowed ([Action])
             VALUES ('INDEX_REBUILD_ONLINE')
@@ -5016,6 +5165,8 @@ BEGIN
           END
         END
 
+        SET @CurrentMaxDOP = @MaxDOP
+
         IF @CurrentStatisticsID IS NOT NULL AND @CurrentUpdateStatistics = 'Y' AND (GETDATE() < DATEADD(ss,@TimeLimit,@StartTime) OR @TimeLimit IS NULL)
         BEGIN
           SET @CurrentCommandType14 = 'UPDATE_STATISTICS'
@@ -5023,12 +5174,49 @@ BEGIN
           SET @CurrentCommand14 = ''
           IF @LockTimeout IS NOT NULL SET @CurrentCommand14 = 'SET LOCK_TIMEOUT ' + CAST(@LockTimeout * 1000 AS nvarchar) + '; '
           SET @CurrentCommand14 = @CurrentCommand14 + 'UPDATE STATISTICS ' + QUOTENAME(@CurrentDatabaseName) + '.' + QUOTENAME(@CurrentSchemaName) + '.' + QUOTENAME(@CurrentObjectName) + ' ' + QUOTENAME(@CurrentStatisticsName)
-          IF @CurrentStatisticsSample IS NOT NULL OR @CurrentStatisticsResample = 'Y' OR @CurrentNoRecompute = 1 SET @CurrentCommand14 = @CurrentCommand14 + ' WITH'
-          IF @CurrentStatisticsSample = 100 SET @CurrentCommand14 = @CurrentCommand14 + ' FULLSCAN'
-          IF @CurrentStatisticsSample IS NOT NULL AND @CurrentStatisticsSample <> 100 SET @CurrentCommand14 = @CurrentCommand14 + ' SAMPLE ' + CAST(@CurrentStatisticsSample AS nvarchar) + ' PERCENT'
-          IF @CurrentStatisticsResample = 'Y' SET @CurrentCommand14 = @CurrentCommand14 + ' RESAMPLE'
-          IF (@CurrentStatisticsSample IS NOT NULL OR @CurrentStatisticsResample = 'Y') AND @CurrentNoRecompute = 1 SET @CurrentCommand14 = @CurrentCommand14 + ','
-          IF @CurrentNoRecompute = 1 SET @CurrentCommand14 = @CurrentCommand14 + ' NORECOMPUTE'
+
+          IF @CurrentStatisticsSample = 100
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'FULLSCAN'
+          END
+
+          IF @CurrentStatisticsSample IS NOT NULL AND @CurrentStatisticsSample <> 100
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'SAMPLE ' + CAST(@CurrentStatisticsSample AS nvarchar) + ' PERCENT'
+          END
+
+          IF @CurrentStatisticsResample = 'Y'
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'RESAMPLE'
+          END
+
+          IF @CurrentNoRecompute = 1
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'NORECOMPUTE'
+          END
+
+          IF @CurrentMaxDOP IS NOT NULL AND ((@Version >= 13.05026 AND @Version < 14) OR @Version >= 14.030154)
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'MAXDOP = ' + CAST(@CurrentMaxDOP AS nvarchar)
+          END
+
+          IF EXISTS (SELECT * FROM @CurrentUpdateStatisticsWithClauseArguments)
+          BEGIN
+            SET @CurrentUpdateStatisticsWithClause = ' WITH'
+
+            SELECT @CurrentUpdateStatisticsWithClause = @CurrentUpdateStatisticsWithClause + ' ' + Argument + ','
+            FROM @CurrentUpdateStatisticsWithClauseArguments
+            ORDER BY ID ASC
+
+            SET @CurrentUpdateStatisticsWithClause = LEFT(@CurrentUpdateStatisticsWithClause,LEN(@CurrentUpdateStatisticsWithClause) - 1)
+          END
+
+          IF @CurrentUpdateStatisticsWithClause IS NOT NULL SET @CurrentCommand14 = @CurrentCommand14 + @CurrentUpdateStatisticsWithClause
 
           EXECUTE @CurrentCommandOutput14 = [dbo].[CommandExecute] @Command = @CurrentCommand14, @CommandType = @CurrentCommandType14, @Mode = 2, @DatabaseName = @CurrentDatabaseName, @SchemaName = @CurrentSchemaName, @ObjectName = @CurrentObjectName, @ObjectType = @CurrentObjectType, @IndexName = @CurrentIndexName, @IndexType = @CurrentIndexType, @StatisticsName = @CurrentStatisticsName, @LogToTable = @LogToTable, @Execute = @Execute
           SET @Error = @@ERROR
@@ -5102,8 +5290,10 @@ BEGIN
         SET @CurrentStatisticsResample = NULL
         SET @CurrentComment = NULL
         SET @CurrentExtendedInfo = NULL
+        SET @CurrentUpdateStatisticsWithClause = NULL
 
         DELETE FROM @CurrentActionsAllowed
+        DELETE FROM @CurrentUpdateStatisticsWithClauseArguments
 
       END
 
@@ -5158,10 +5348,7 @@ BEGIN
 END
 
 GO
-
-IF (SELECT CAST([Value] AS int) FROM #Config WHERE Name = 'Error') = 0
-AND (SELECT [Value] FROM #Config WHERE Name = 'CreateJobs') = 'Y'
-AND SERVERPROPERTY('EngineEdition') <> 4
+IF (SELECT [Value] FROM #Config WHERE Name = 'CreateJobs') = 'Y' AND SERVERPROPERTY('EngineEdition') <> 4 AND (IS_SRVROLEMEMBER('sysadmin') = 1 OR (DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa'))
 BEGIN
 
   DECLARE @BackupDirectory nvarchar(max)
@@ -5171,6 +5358,10 @@ BEGIN
   DECLARE @DatabaseName nvarchar(max)
 
   DECLARE @Version numeric(18,10)
+  DECLARE @HostPlatform nvarchar(max)
+  DECLARE @AmazonRDS bit
+  DECLARE @DirectorySeparator nvarchar(max)
+  DECLARE @LogDirectory nvarchar(max)
 
   DECLARE @TokenServer nvarchar(max)
   DECLARE @TokenJobID nvarchar(max)
@@ -5183,43 +5374,47 @@ BEGIN
   DECLARE @JobCategory nvarchar(max)
   DECLARE @JobOwner nvarchar(max)
 
-  DECLARE @JobName01 nvarchar(max)
-  DECLARE @JobName02 nvarchar(max)
-  DECLARE @JobName03 nvarchar(max)
-  DECLARE @JobName04 nvarchar(max)
-  DECLARE @JobName05 nvarchar(max)
-  DECLARE @JobName06 nvarchar(max)
-  DECLARE @JobName07 nvarchar(max)
-  DECLARE @JobName08 nvarchar(max)
-  DECLARE @JobName09 nvarchar(max)
-  DECLARE @JobName10 nvarchar(max)
-  DECLARE @JobName11 nvarchar(max)
+  DECLARE @Jobs TABLE (JobID int IDENTITY,
+                       [Name] nvarchar(max),
+                       CommandTSQL nvarchar(max),
+                       CommandCmdExec nvarchar(max),
+                       DatabaseName varchar(max),
+                       OutputFileNamePart01 nvarchar(max),
+                       OutputFileNamePart02 nvarchar(max),
+                       Selected bit DEFAULT 0,
+                       Completed bit DEFAULT 0)
 
-  DECLARE @JobCommand01 nvarchar(max)
-  DECLARE @JobCommand02 nvarchar(max)
-  DECLARE @JobCommand03 nvarchar(max)
-  DECLARE @JobCommand04 nvarchar(max)
-  DECLARE @JobCommand05 nvarchar(max)
-  DECLARE @JobCommand06 nvarchar(max)
-  DECLARE @JobCommand07 nvarchar(max)
-  DECLARE @JobCommand08 nvarchar(max)
-  DECLARE @JobCommand09 nvarchar(max)
-  DECLARE @JobCommand10 nvarchar(max)
-  DECLARE @JobCommand11 nvarchar(max)
+  DECLARE @CurrentJobID int
+  DECLARE @CurrentJobName nvarchar(max)
+  DECLARE @CurrentCommandTSQL nvarchar(max)
+  DECLARE @CurrentCommandCmdExec nvarchar(max)
+  DECLARE @CurrentDatabaseName nvarchar(max)
+  DECLARE @CurrentOutputFileNamePart01 nvarchar(max)
+  DECLARE @CurrentOutputFileNamePart02 nvarchar(max)
 
-  DECLARE @OutputFile01 nvarchar(max)
-  DECLARE @OutputFile02 nvarchar(max)
-  DECLARE @OutputFile03 nvarchar(max)
-  DECLARE @OutputFile04 nvarchar(max)
-  DECLARE @OutputFile05 nvarchar(max)
-  DECLARE @OutputFile06 nvarchar(max)
-  DECLARE @OutputFile07 nvarchar(max)
-  DECLARE @OutputFile08 nvarchar(max)
-  DECLARE @OutputFile09 nvarchar(max)
-  DECLARE @OutputFile10 nvarchar(max)
-  DECLARE @OutputFile11 nvarchar(max)
+  DECLARE @CurrentJobStepCommand nvarchar(max)
+  DECLARE @CurrentJobStepSubSystem nvarchar(max)
+  DECLARE @CurrentJobStepDatabaseName nvarchar(max)
+  DECLARE @CurrentOutputFileName nvarchar(max)
 
   SET @Version = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - 1) + '.' + REPLACE(RIGHT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)), LEN(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)))),'.','') AS numeric(18,10))
+
+  SET @AmazonRDS = CASE WHEN DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa' THEN 1 ELSE 0 END
+
+  IF @Version >= 14
+  BEGIN
+    SELECT @HostPlatform = host_platform
+    FROM sys.dm_os_host_info
+  END
+  ELSE
+  BEGIN
+    SET @HostPlatform = 'Windows'
+  END
+
+  SELECT @DirectorySeparator = CASE
+  WHEN @HostPlatform = 'Windows' THEN '\'
+  WHEN @HostPlatform = 'Linux' THEN '/'
+  END
 
   IF @Version >= 9.002047
   BEGIN
@@ -5238,7 +5433,7 @@ BEGIN
     SET @TokenTime = '$' + '(STRTTM)'
   END
 
-  IF @Version >= 12
+  IF @Version >= 12 AND @HostPlatform = 'Windows'
   BEGIN
     SET @TokenLogDirectory = '$' + '(ESCAPE_SQUOTE(SQLLOGDIR))'
   END
@@ -5247,9 +5442,12 @@ BEGIN
   FROM #Config
   WHERE [Name] = 'BackupDirectory'
 
-  SELECT @CleanupTime = Value
-  FROM #Config
-  WHERE [Name] = 'CleanupTime'
+  IF @HostPlatform = 'Windows'
+  BEGIN
+    SELECT @CleanupTime = Value
+    FROM #Config
+    WHERE [Name] = 'CleanupTime'
+  END
 
   SELECT @OutputFileDirectory = Value
   FROM #Config
@@ -5263,151 +5461,210 @@ BEGIN
   FROM #Config
   WHERE [Name] = 'DatabaseName'
 
+  IF @Version >= 11
+  BEGIN
+    SELECT @LogDirectory = [path]
+    FROM sys.dm_os_server_diagnostics_log_configurations
+  END
+  ELSE
+  BEGIN
+    SELECT @LogDirectory = LEFT(CAST(SERVERPROPERTY('ErrorLogFileName') AS nvarchar(max)),LEN(CAST(SERVERPROPERTY('ErrorLogFileName') AS nvarchar(max))) - CHARINDEX('\',REVERSE(CAST(SERVERPROPERTY('ErrorLogFileName') AS nvarchar(max)))))
+  END
+
+  IF @OutputFileDirectory IS NULL AND RIGHT(@OutputFileDirectory,1) = @DirectorySeparator
+  BEGIN
+    SET @OutputFileDirectory = LEFT(@OutputFileDirectory, LEN(@OutputFileDirectory) - 1)
+  END
+
+  IF @LogDirectory IS NOT NULL AND RIGHT(@LogDirectory,1) = @DirectorySeparator
+  BEGIN
+    SET @LogDirectory = LEFT(@LogDirectory, LEN(@LogDirectory) - 1)
+  END
+
   SET @JobDescription = 'Source: https://ola.hallengren.com'
   SET @JobCategory = 'Database Maintenance'
-  SET @JobOwner = SUSER_SNAME(0x01)
 
-  SET @JobName01 = 'DatabaseBackup - SYSTEM_DATABASES - FULL'
-  SET @JobCommand01 = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + @DatabaseName + ' -Q "EXECUTE [dbo].[DatabaseBackup] @Databases = ''SYSTEM_DATABASES'', @Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ', @BackupType = ''FULL'', @Verify = ''Y'', @CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ', @CheckSum = ''Y''' + CASE WHEN @LogToTable = 'Y' THEN ', @LogToTable = ''Y''' ELSE '' END + '" -b'
-  SET @OutputFile01 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'DatabaseBackup_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile01) > 200 SET @OutputFile01 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile01) > 200 SET @OutputFile01 = NULL
-
-  SET @JobName02 = 'DatabaseBackup - USER_DATABASES - DIFF'
-  SET @JobCommand02 = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + @DatabaseName + ' -Q "EXECUTE [dbo].[DatabaseBackup] @Databases = ''USER_DATABASES'', @Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ', @BackupType = ''DIFF'', @Verify = ''Y'', @CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ', @CheckSum = ''Y''' + CASE WHEN @LogToTable = 'Y' THEN ', @LogToTable = ''Y''' ELSE '' END + '" -b'
-  SET @OutputFile02 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'DatabaseBackup_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile02) > 200 SET @OutputFile02 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile02) > 200 SET @OutputFile02 = NULL
-
-  SET @JobName03 = 'DatabaseBackup - USER_DATABASES - FULL'
-  SET @JobCommand03 = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + @DatabaseName + ' -Q "EXECUTE [dbo].[DatabaseBackup] @Databases = ''USER_DATABASES'', @Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ', @BackupType = ''FULL'', @Verify = ''Y'', @CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ', @CheckSum = ''Y''' + CASE WHEN @LogToTable = 'Y' THEN ', @LogToTable = ''Y''' ELSE '' END + '" -b'
-  SET @OutputFile03 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'DatabaseBackup_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile03) > 200 SET @OutputFile03 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile03) > 200 SET @OutputFile03 = NULL
-
-  SET @JobName04 = 'DatabaseBackup - USER_DATABASES - LOG'
-  SET @JobCommand04 = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + @DatabaseName + ' -Q "EXECUTE [dbo].[DatabaseBackup] @Databases = ''USER_DATABASES'', @Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ', @BackupType = ''LOG'', @Verify = ''Y'', @CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ', @CheckSum = ''Y''' + CASE WHEN @LogToTable = 'Y' THEN ', @LogToTable = ''Y''' ELSE '' END + '" -b'
-  SET @OutputFile04 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'DatabaseBackup_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile04) > 200 SET @OutputFile04 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile04) > 200 SET @OutputFile04 = NULL
-
-  SET @JobName05 = 'DatabaseIntegrityCheck - SYSTEM_DATABASES'
-  SET @JobCommand05 = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + @DatabaseName + ' -Q "EXECUTE [dbo].[DatabaseIntegrityCheck] @Databases = ''SYSTEM_DATABASES''' + CASE WHEN @LogToTable = 'Y' THEN ', @LogToTable = ''Y''' ELSE '' END + '" -b'
-  SET @OutputFile05 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'DatabaseIntegrityCheck_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile05) > 200 SET @OutputFile05 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile05) > 200 SET @OutputFile05 = NULL
-
-  SET @JobName06 = 'DatabaseIntegrityCheck - USER_DATABASES'
-  SET @JobCommand06 = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + @DatabaseName + ' -Q "EXECUTE [dbo].[DatabaseIntegrityCheck] @Databases = ''USER_DATABASES''' + CASE WHEN @LogToTable = 'Y' THEN ', @LogToTable = ''Y''' ELSE '' END + '" -b'
-  SET @OutputFile06 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'DatabaseIntegrityCheck_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile06) > 200 SET @OutputFile06 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile06) > 200 SET @OutputFile06 = NULL
-
-  SET @JobName07 = 'IndexOptimize - USER_DATABASES'
-  SET @JobCommand07 = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + @DatabaseName + ' -Q "EXECUTE [dbo].[IndexOptimize] @Databases = ''USER_DATABASES''' + CASE WHEN @LogToTable = 'Y' THEN ', @LogToTable = ''Y''' ELSE '' END + '" -b'
-  SET @OutputFile07 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'IndexOptimize_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile07) > 200 SET @OutputFile07 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile07) > 200 SET @OutputFile07 = NULL
-
-  SET @JobName08 = 'sp_delete_backuphistory'
-  SET @JobCommand08 = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + 'msdb' + ' -Q "DECLARE @CleanupDate datetime SET @CleanupDate = DATEADD(dd,-30,GETDATE()) EXECUTE dbo.sp_delete_backuphistory @oldest_date = @CleanupDate" -b'
-  SET @OutputFile08 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'sp_delete_backuphistory_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile08) > 200 SET @OutputFile08 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile08) > 200 SET @OutputFile08 = NULL
-
-  SET @JobName09 = 'sp_purge_jobhistory'
-  SET @JobCommand09 = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + 'msdb' + ' -Q "DECLARE @CleanupDate datetime SET @CleanupDate = DATEADD(dd,-30,GETDATE()) EXECUTE dbo.sp_purge_jobhistory @oldest_date = @CleanupDate" -b'
-  SET @OutputFile09 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'sp_purge_jobhistory_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile09) > 200 SET @OutputFile09 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile09) > 200 SET @OutputFile09 = NULL
-
-  SET @JobName10 = 'Output File Cleanup'
-  SET @JobCommand10 = 'cmd /q /c "For /F "tokens=1 delims=" %v In (''ForFiles /P "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '" /m *_*_*_*.txt /d -30 2^>^&1'') do if EXIST "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '"\%v echo del "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '"\%v& del "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '"\%v"'
-  SET @OutputFile10 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'OutputFileCleanup_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile10) > 200 SET @OutputFile10 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile10) > 200 SET @OutputFile10 = NULL
-
-  SET @JobName11 = 'CommandLog Cleanup'
-  SET @JobCommand11 = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + @DatabaseName + ' -Q "DELETE FROM [dbo].[CommandLog] WHERE StartTime < DATEADD(dd,-30,GETDATE())" -b'
-  SET @OutputFile11 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + 'CommandLogCleanup_' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile11) > 200 SET @OutputFile11 = COALESCE(@OutputFileDirectory,@TokenLogDirectory) + '\' + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
-  IF LEN(@OutputFile11) > 200 SET @OutputFile11 = NULL
-
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName01)
+  IF @AmazonRDS = 0
   BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName01, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName01, @step_name = @JobName01, @subsystem = 'CMDEXEC', @command = @JobCommand01, @output_file_name = @OutputFile01
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName01
+    SET @JobOwner = SUSER_SNAME(0x01)
   END
 
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName02)
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
+  SELECT 'DatabaseBackup - SYSTEM_DATABASES - FULL',
+         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''SYSTEM_DATABASES'',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''FULL'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         @DatabaseName,
+         'DatabaseBackup',
+         'FULL'
+
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
+  SELECT 'DatabaseBackup - USER_DATABASES - DIFF',
+         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''DIFF'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+          @DatabaseName,
+         'DatabaseBackup',
+         'DIFF'
+
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
+  SELECT 'DatabaseBackup - USER_DATABASES - FULL',
+         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''FULL'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         @DatabaseName,
+         'DatabaseBackup',
+         'FULL'
+
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
+  SELECT 'DatabaseBackup - USER_DATABASES - LOG',
+         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''LOG'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         @DatabaseName,
+         'DatabaseBackup',
+         'LOG'
+
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  SELECT 'DatabaseIntegrityCheck - SYSTEM_DATABASES',
+         'EXECUTE [dbo].[DatabaseIntegrityCheck]' + CHAR(13) + CHAR(10) + '@Databases = ''SYSTEM_DATABASES'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         @DatabaseName,
+         'DatabaseIntegrityCheck'
+
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  SELECT 'DatabaseIntegrityCheck - USER_DATABASES',
+         'EXECUTE [dbo].[DatabaseIntegrityCheck]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES' + CASE WHEN @AmazonRDS = 1 THEN ', -rdsadmin' ELSE '' END + ''',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         @DatabaseName,
+         'DatabaseIntegrityCheck'
+
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  SELECT 'IndexOptimize - USER_DATABASES',
+         'EXECUTE [dbo].[IndexOptimize]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         @DatabaseName,
+         'IndexOptimize'
+
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  SELECT 'sp_delete_backuphistory',
+         'DECLARE @CleanupDate datetime' + CHAR(13) + CHAR(10) + 'SET @CleanupDate = DATEADD(dd,-30,GETDATE())' + CHAR(13) + CHAR(10) + 'EXECUTE dbo.sp_delete_backuphistory @oldest_date = @CleanupDate',
+         'msdb',
+         'sp_delete_backuphistory'
+
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  SELECT 'sp_purge_jobhistory',
+         'DECLARE @CleanupDate datetime' + CHAR(13) + CHAR(10) + 'SET @CleanupDate = DATEADD(dd,-30,GETDATE())' + CHAR(13) + CHAR(10) + 'EXECUTE dbo.sp_purge_jobhistory @oldest_date = @CleanupDate',
+         'msdb',
+         'sp_purge_jobhistory'
+
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  SELECT 'CommandLog Cleanup',
+         'DELETE FROM [dbo].[CommandLog]' + CHAR(13) + CHAR(10) + 'WHERE StartTime < DATEADD(dd,-30,GETDATE())',
+         @DatabaseName,
+         'CommandLogCleanup'
+
+  INSERT INTO @Jobs ([Name], CommandCmdExec, OutputFileNamePart01)
+  SELECT 'Output File Cleanup',
+         'cmd /q /c "For /F "tokens=1 delims=" %v In (''ForFiles /P "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '" /m *_*_*_*.txt /d -30 2^>^&1'') do if EXIST "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '"\%v echo del "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '"\%v& del "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '"\%v"',
+         'OutputFileCleanup'
+
+  IF @AmazonRDS = 1
   BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName02, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName02, @step_name = @JobName02, @subsystem = 'CMDEXEC', @command = @JobCommand02, @output_file_name = @OutputFile02
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName02
+   UPDATE @Jobs
+   SET Selected = 1
+   WHERE [Name] IN('DatabaseIntegrityCheck - USER_DATABASES','IndexOptimize - USER_DATABASES','CommandLog Cleanup')
+  END
+  ELSE IF SERVERPROPERTY('EngineEdition') = 8
+  BEGIN
+   UPDATE @Jobs
+   SET Selected = 1
+   WHERE [Name] IN('DatabaseIntegrityCheck - SYSTEM_DATABASES','DatabaseIntegrityCheck - USER_DATABASES','IndexOptimize - USER_DATABASES','CommandLog Cleanup','sp_delete_backuphistory','sp_purge_jobhistory')
+  END
+  ELSE IF @HostPlatform = 'Windows'
+  BEGIN
+   UPDATE @Jobs
+   SET Selected = 1
+  END
+  ELSE IF @HostPlatform = 'Linux'
+  BEGIN
+   UPDATE @Jobs
+   SET Selected = 1
+   WHERE CommandTSQL IS NOT NULL
   END
 
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName03)
+  WHILE EXISTS (SELECT * FROM @Jobs WHERE Completed = 0 AND Selected = 1)
   BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName03, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName03, @step_name = @JobName03, @subsystem = 'CMDEXEC', @command = @JobCommand03, @output_file_name = @OutputFile03
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName03
-  END
+    SELECT @CurrentJobID = JobID,
+           @CurrentJobName = [Name],
+           @CurrentCommandTSQL = CommandTSQL,
+           @CurrentCommandCmdExec = CommandCmdExec,
+           @CurrentDatabaseName = DatabaseName,
+           @CurrentOutputFileNamePart01 = OutputFileNamePart01,
+           @CurrentOutputFileNamePart02 = OutputFileNamePart02
+    FROM @Jobs
+    WHERE Completed = 0
+    AND Selected = 1
+    ORDER BY JobID ASC
 
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName04)
-  BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName04, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName04, @step_name = @JobName04, @subsystem = 'CMDEXEC', @command = @JobCommand04, @output_file_name = @OutputFile04
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName04
-  END
+    IF @CurrentCommandTSQL IS NOT NULL AND @AmazonRDS = 1
+    BEGIN
+      SET @CurrentJobStepSubSystem = 'TSQL'
+      SET @CurrentJobStepCommand = @CurrentCommandTSQL
+      SET @CurrentJobStepDatabaseName = @CurrentDatabaseName
+    END
+    ELSE IF @CurrentCommandTSQL IS NOT NULL AND SERVERPROPERTY('EngineEdition') = 8
+    BEGIN
+      SET @CurrentJobStepSubSystem = 'TSQL'
+      SET @CurrentJobStepCommand = @CurrentCommandTSQL
+      SET @CurrentJobStepDatabaseName = @CurrentDatabaseName
+    END
+    ELSE IF @CurrentCommandTSQL IS NOT NULL AND @HostPlatform = 'Linux'
+    BEGIN
+      SET @CurrentJobStepSubSystem = 'TSQL'
+      SET @CurrentJobStepCommand = @CurrentCommandTSQL
+      SET @CurrentJobStepDatabaseName = @CurrentDatabaseName
+    END
+    ELSE IF @CurrentCommandTSQL IS NOT NULL AND @HostPlatform = 'Windows' AND @Version >= 11
+    BEGIN
+      SET @CurrentJobStepSubSystem = 'TSQL'
+      SET @CurrentJobStepCommand = @CurrentCommandTSQL
+      SET @CurrentJobStepDatabaseName = @CurrentDatabaseName
+    END
+    ELSE IF @CurrentCommandTSQL IS NOT NULL AND @HostPlatform = 'Windows' AND @Version < 11
+    BEGIN
+      SET @CurrentJobStepSubSystem = 'CMDEXEC'
+      SET @CurrentJobStepCommand = 'sqlcmd -E -S ' + @TokenServer + ' -d ' + @CurrentDatabaseName + ' -Q "' + REPLACE(@CurrentCommandTSQL,(CHAR(13) + CHAR(10)),' ') + '" -b'
+      SET @CurrentJobStepDatabaseName = NULL
+    END
+    ELSE IF @CurrentCommandCmdExec IS NOT NULL AND @HostPlatform = 'Windows'
+    BEGIN
+      SET @CurrentJobStepSubSystem = 'CMDEXEC'
+      SET @CurrentJobStepCommand = @CurrentCommandCmdExec
+      SET @CurrentJobStepDatabaseName = NULL
+    END
 
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName05)
-  BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName05, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName05, @step_name = @JobName05, @subsystem = 'CMDEXEC', @command = @JobCommand05, @output_file_name = @OutputFile05
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName05
-  END
+    IF @AmazonRDS = 0 AND SERVERPROPERTY('EngineEdition') <> 8
+    BEGIN
+      SET @CurrentOutputFileName = COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + @DirectorySeparator + ISNULL(@CurrentOutputFileNamePart01 + '_','') + ISNULL(@CurrentOutputFileNamePart02 + '_','') + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
+      IF LEN(@CurrentOutputFileName) > 200 SET @CurrentOutputFileName = COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + @DirectorySeparator + ISNULL(@CurrentOutputFileNamePart01 + '_','') + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
+      IF LEN(@CurrentOutputFileName) > 200 SET @CurrentOutputFileName = COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + @DirectorySeparator + @TokenJobID + '_' + @TokenStepID + '_' + @TokenDate + '_' + @TokenTime + '.txt'
+      IF LEN(@CurrentOutputFileName) > 200 SET @CurrentOutputFileName = NULL
+    END
 
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName06)
-  BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName06, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName06, @step_name = @JobName06, @subsystem = 'CMDEXEC', @command = @JobCommand06, @output_file_name = @OutputFile06
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName06
-  END
+    IF @CurrentJobStepSubSystem IS NOT NULL AND @CurrentJobStepCommand IS NOT NULL AND NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @CurrentJobName)
+    BEGIN
+      EXECUTE msdb.dbo.sp_add_job @job_name = @CurrentJobName, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
+      EXECUTE msdb.dbo.sp_add_jobstep @job_name = @CurrentJobName, @step_name = @CurrentJobName, @subsystem = @CurrentJobStepSubSystem, @command = @CurrentJobStepCommand, @output_file_name = @CurrentOutputFileName, @database_name = @CurrentJobStepDatabaseName
+      EXECUTE msdb.dbo.sp_add_jobserver @job_name = @CurrentJobName
+    END
 
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName07)
-  BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName07, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName07, @step_name = @JobName07, @subsystem = 'CMDEXEC', @command = @JobCommand07, @output_file_name = @OutputFile07
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName07
-  END
+    UPDATE Jobs
+    SET Completed = 1
+    FROM @Jobs Jobs
+    WHERE JobID = @CurrentJobID
 
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName08)
-  BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName08, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName08, @step_name = @JobName08, @subsystem = 'CMDEXEC', @command = @JobCommand08, @output_file_name = @OutputFile08
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName08
-  END
+    SET @CurrentJobID = NULL
+    SET @CurrentJobName = NULL
+    SET @CurrentCommandTSQL = NULL
+    SET @CurrentCommandCmdExec = NULL
+    SET @CurrentDatabaseName = NULL
+    SET @CurrentOutputFileNamePart01 = NULL
+    SET @CurrentOutputFileNamePart02 = NULL
+    SET @CurrentJobStepCommand = NULL
+    SET @CurrentJobStepSubSystem = NULL
+    SET @CurrentJobStepDatabaseName = NULL
+    SET @CurrentOutputFileName = NULL
 
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName09)
-  BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName09, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName09, @step_name = @JobName09, @subsystem = 'CMDEXEC', @command = @JobCommand09, @output_file_name = @OutputFile09
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName09
-  END
-
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName10)
-  BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName10, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName10, @step_name = @JobName10, @subsystem = 'CMDEXEC', @command = @JobCommand10, @output_file_name = @OutputFile10
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName10
-  END
-
-  IF NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @JobName11)
-  BEGIN
-    EXECUTE msdb.dbo.sp_add_job @job_name = @JobName11, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
-    EXECUTE msdb.dbo.sp_add_jobstep @job_name = @JobName11, @step_name = @JobName11, @subsystem = 'CMDEXEC', @command = @JobCommand11, @output_file_name = @OutputFile11
-    EXECUTE msdb.dbo.sp_add_jobserver @job_name = @JobName11
   END
 
 END
