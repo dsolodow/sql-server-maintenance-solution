@@ -240,13 +240,6 @@ BEGIN
     SET @Error = @@ERROR
   END
 
-  IF SERVERPROPERTY('EngineEdition') = 5 AND @Version < 12
-  BEGIN
-    SET @ErrorMessage = 'The stored procedure DatabaseIntegrityCheck is not supported on this version of Azure SQL Database.' + CHAR(13) + CHAR(10) + ' '
-    RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
-    SET @Error = @@ERROR
-  END
-
   IF @Error <> 0
   BEGIN
     SET @ReturnCode = @Error
@@ -308,7 +301,7 @@ BEGIN
   FROM Databases4
   OPTION (MAXRECURSION 0)
 
-  IF @Version >= 11
+  IF @Version >= 11 AND SERVERPROPERTY('IsHadrEnabled') = 1
   BEGIN
     INSERT INTO @tmpAvailabilityGroups (AvailabilityGroupName, Selected)
     SELECT name AS AvailabilityGroupName,
